@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Configurações - SPFBL Dashboard</title>
+    <link rel="stylesheet" href="dashboard.css">
+    <style>
+        .settings-container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        .settings-content {
+            width: 100%;
+        }
+
+        .settings-section {
+            display: none;
+        }
+
+        .settings-section.active {
+            display: block;
+        }
+
+        .editor-container {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .editor-label {
+            display: block;
+            margin-bottom: 0.75rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .editor-description {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            margin-bottom: 1rem;
+            line-height: 1.5;
+        }
+
+        textarea.config-editor {
+            width: 100%;
+            min-height: 400px;
+            padding: 1rem;
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+            color: var(--text-primary);
+            resize: vertical;
+            line-height: 1.5;
+        }
+
+        textarea.config-editor:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+
+        .editor-actions {
+            display: flex;
+            gap: 1rem;
+            margin-top: 1.5rem;
+            flex-wrap: wrap;
+        }
+
+        .btn-save {
+            background: var(--success-color);
+            color: white;
+            border: none;
+            padding: 0.75rem 2rem;
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .btn-save:hover {
+            background: #059669;
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+        }
+
+        .btn-save:disabled {
+            background: #cbd5e1;
+            cursor: not-allowed;
+            opacity: 0.6;
+        }
+
+        .btn-reset {
+            background: var(--surface-light);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+            padding: 0.75rem 2rem;
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .btn-reset:hover {
+            background: var(--surface-hover);
+        }
+
+        .status-message {
+            padding: 0.75rem 1rem;
+            border-radius: 6px;
+            margin-bottom: 1rem;
+        }
+
+        .status-message.success {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid var(--success-color);
+            color: #6ee7b7;
+        }
+
+        .status-message.error {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid var(--danger-color);
+            color: #fca5a5;
+        }
+
+        .config-info {
+            background: rgba(37, 99, 235, 0.05);
+            border-left: 4px solid var(--primary-color);
+            padding: 1rem;
+            border-radius: 6px;
+            margin-bottom: 1.5rem;
+        }
+
+        .config-info h4 {
+            margin: 0 0 0.5rem 0;
+            color: var(--primary-color);
+        }
+
+        .config-info p {
+            margin: 0;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            line-height: 1.5;
+        }
+
+        .file-path {
+            font-family: 'Courier New', monospace;
+            background: var(--bg-color);
+            padding: 0.25rem 0.5rem;
+            border-radius: 3px;
+            color: #10b981;
+        }
+
+        .char-count {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            margin-top: 0.5rem;
+        }
+
+        .line-count {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+        }
+
+        @media (max-width: 768px) {
+            .settings-container {
+                grid-template-columns: 1fr;
+                gap: 1rem;
+            }
+
+            .settings-menu {
+                display: flex;
+                overflow-x: auto;
+                border-right: none;
+                border-bottom: 1px solid var(--border-color);
+                padding-right: 0;
+                padding-bottom: 1rem;
+                margin-bottom: 1rem;
+            }
+
+            .menu-item {
+                white-space: nowrap;
+                margin-bottom: 0;
+                margin-right: 0.5rem;
+            }
+        }
+            .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            background: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.9rem;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+
+        .status-message.info {
+            background: rgba(59, 130, 246, 0.08);
+            border: 1px solid rgba(59, 130, 246, 0.4);
+            color: #bfdbfe;
+        }
+
+        .flex-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            align-items: center;
+        }
+
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.35rem 0.75rem;
+            border-radius: 999px;
+            background: var(--surface-light);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 0.75rem;
+            flex-wrap: wrap;
+        }
+
+        .small-note {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+
+        .section-actions {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .ghost-btn {
+            background: transparent;
+            color: var(--primary-color);
+            border: 1px solid var(--primary-color);
+            padding: 0.4rem 0.9rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.2s ease;
+        }
+
+        .ghost-btn:hover {
+            background: rgba(59, 130, 246, 0.08);
+        }
+
+        .muted {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+
+        .counts {
+            display: flex;
+            gap: 0.75rem;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            flex-wrap: wrap;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="sidebar">
+            <div class="sidebar-content">
+                <div class="sidebar-header">
+                    <h2>SPFBL</h2>
+                </div>
+                <nav class="sidebar-nav">
+                    <a href="/dashboard" class="nav-item">
+                        📊 Dashboard
+                    </a>
+                    <a href="/settings" class="nav-item active">
+                        ⚙️ Configuração
+                    </a>
+                </nav>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Header -->
+            <header class="header">
+                <h2 id="page-title">⚙️ Configuração</h2>
+            </header>
+
+            <div class="settings-container">
+                <div class="settings-content">
+                    <div id="config" class="settings-section active">
+                        <div class="config-info">
+                            <h4>📝 Editor de Configuração</h4>
+                            <p>Edite o arquivo do SPFBL diretamente no servidor. O conteúdo é carregado de <span class="file-path">/opt/spfbl/spfbl.conf</span> e salvo preservando a codificação UTF-8.</p>
+                            <div class="flex-row">
+                                <span class="pill">📄 /opt/spfbl/spfbl.conf</span>
+                                <span class="pill">💾 Backup automático antes de salvar</span>
+                                <span class="pill">🔒 Requer sessão autenticada</span>
+                            </div>
+                            <p class="small-note">Um backup com timestamp é criado antes de gravar. Em caso de falha, o backup é restaurado automaticamente.</p>
+                        </div>
+
+                        <div class="status-area">
+                            <div id="status-banner" class="status-message" style="display:none;"></div>
+                            [[STATUS_BLOCK]]
+                        </div>
+
+                        <div class="editor-container">
+                            <div class="section-header">
+                                <div>
+                                    <h4>Arquivo completo</h4>
+                                    <p class="editor-description">Visualize e altere o conteúdo integral do <span class="file-path">spfbl.conf</span>. Use com atenção.</p>
+                                </div>
+                                <div class="counts">
+                                    <span><strong id="line-count">[[LINE_COUNT]]</strong> linhas</span>
+                                    <span><strong id="char-count">[[CHAR_COUNT]]</strong> caracteres</span>
+                                </div>
+                            </div>
+
+                            <form method="POST" action="/settings" id="config-form">
+                                <textarea id="config-editor" name="content" class="config-editor" placeholder="Carregando configuração...">[[CONFIG_CONTENT]]</textarea>
+
+                                <div class="editor-actions">
+                                    <button class="btn-save" type="submit" id="save-btn">
+                                        💾 Salvar arquivo
+                                    </button>
+                                    <button class="btn-reset" type="button" id="reload-btn">
+                                        🔄 Recarregar do servidor
+                                    </button>
+                                </div>
+                                <p class="muted">Um backup automático será criado antes de salvar (spfbl.conf.backup-{timestamp}).</p>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // Carregamento e salvamento dinâmico da configuração
+        (function () {
+            const CONFIG_ENDPOINT = '/api/settings/config';
+
+            const configEditor = document.getElementById('config-editor');
+            const lineCountEl = document.getElementById('line-count');
+            const charCountEl = document.getElementById('char-count');
+            const saveBtn = document.getElementById('save-btn');
+            const reloadBtn = document.getElementById('reload-btn');
+            const configForm = document.getElementById('config-form');
+            const statusBanner = document.getElementById('status-banner');
+
+            let lastLoadedContent = '';
+            let isSaving = false;
+
+            const setStatus = (message, type = 'info') => {
+                if (!statusBanner) return;
+                statusBanner.textContent = message || '';
+                statusBanner.className = `status-message ${type}`;
+                statusBanner.style.display = message ? 'block' : 'none';
+            };
+
+            const updateCounters = () => {
+                if (!configEditor || !lineCountEl || !charCountEl) return;
+                const value = configEditor.value || '';
+                lineCountEl.textContent = value ? value.split('\n').length : 0;
+                charCountEl.textContent = value.length;
+            };
+
+            const toggleSaving = (state) => {
+                isSaving = state;
+                const action = state ? 'add' : 'remove';
+                saveBtn?.setAttribute('aria-busy', state);
+                reloadBtn?.setAttribute('aria-busy', state);
+                if (state) {
+                    saveBtn?.setAttribute('disabled', 'disabled');
+                    reloadBtn?.setAttribute('disabled', 'disabled');
+                } else {
+                    saveBtn?.removeAttribute('disabled');
+                    reloadBtn?.removeAttribute('disabled');
+                }
+            };
+
+            const loadConfig = async (showMessage = true) => {
+                if (!configEditor) return;
+                try {
+                    if (showMessage) {
+                        setStatus('Carregando configuração do servidor...', 'info');
+                    }
+
+                    const response = await fetch(CONFIG_ENDPOINT, { credentials: 'include' });
+                    if (response.status === 401) {
+                        window.location.href = '/login';
+                        return;
+                    }
+                    const data = await response.json();
+
+                    if (!response.ok || data.error || data.success === false) {
+                        throw new Error(data.error || 'Não foi possível ler o arquivo de configuração');
+                    }
+
+                    if (typeof data.content === 'string') {
+                        configEditor.value = data.content;
+                        lastLoadedContent = data.content;
+                        updateCounters();
+                    }
+
+                    setStatus(`Configuração carregada de ${data.path || '/opt/spfbl/spfbl.conf'}`, 'success');
+                } catch (error) {
+                    setStatus(error?.message || 'Erro ao carregar configuração', 'error');
+                    updateCounters();
+                }
+            };
+
+            const saveConfig = async (contentOverride) => {
+                if (!configEditor || isSaving) return false;
+                const content = typeof contentOverride === 'string' ? contentOverride : (configEditor.value || '');
+
+                if (!content.trim()) {
+                    setStatus('O arquivo não pode estar vazio.', 'error');
+                    return false;
+                }
+
+                toggleSaving(true);
+                setStatus('Salvando configuração...', 'info');
+
+                try {
+                    const response = await fetch(CONFIG_ENDPOINT, {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content })
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/login';
+                        return false;
+                    }
+
+                    const data = await response.json().catch(() => ({}));
+
+                    if (!response.ok || data.error || data.success === false) {
+                        throw new Error(data.error || data.message || 'Erro ao salvar configuração');
+                    }
+
+                    lastLoadedContent = content;
+                    updateCounters();
+
+                    const backupMsg = data.backup ? ` (backup em ${data.backup})` : '';
+                    setStatus((data.message || 'Configuração salva com sucesso') + backupMsg, 'success');
+                    return true;
+                } catch (error) {
+                    setStatus(error?.message || 'Erro ao salvar configuração', 'error');
+                    return false;
+                } finally {
+                    toggleSaving(false);
+                }
+            };
+
+            // Eventos
+            configEditor?.addEventListener('input', updateCounters);
+            configForm?.addEventListener('submit', (event) => {
+                event.preventDefault();
+                saveConfig();
+            });
+            reloadBtn?.addEventListener('click', (event) => {
+                event.preventDefault();
+                loadConfig(true);
+            });
+
+            // Se servidor já preencheu, reutiliza conteúdo inicial; depois busca a versão atual
+            if (configEditor && configEditor.value && !configEditor.value.includes('[[CONFIG_CONTENT]]')) {
+                lastLoadedContent = configEditor.value;
+                updateCounters();
+            } else {
+                updateCounters();
+            }
+
+            loadConfig(true);
+        })();
+    </script>
+</body>
+</html>

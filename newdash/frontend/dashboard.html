@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SPFBL Dashboard - Painel Administrativo</title>
+    <link rel="stylesheet" href="dashboard.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-toggle" onclick="toggleSidebar()" title="Compactar/Expandir">
+                ◀
+            </div>
+            <div class="logo">
+                <img src="/logo.png" alt="Logo SPFBL" style="max-width:200px;max-height:50px;width:auto;height:auto;">
+            </div>
+            <nav class="nav">
+                <a href="#dashboard" class="nav-item active" onclick="showSection('dashboard', event)" data-label="Dashboard">
+                    <span class="icon">📊</span>
+                    Dashboard
+                </a>
+                <a href="#queries" class="nav-item" onclick="showSection('queries', event)" data-label="Consultas">
+                    <span class="icon">📧</span>
+                    Consultas
+                </a>
+                <a href="#servers" class="nav-item" onclick="showSection('servers', event)" data-label="Servidores">
+                    <span class="icon">🖥️</span>
+                    Servidores
+                </a>
+                <a href="#users" class="nav-item" onclick="showSection('users', event)" data-label="Usuários">
+                    <span class="icon">👥</span>
+                    Usuários
+                </a>
+                <a href="#stats" class="nav-item" onclick="showSection('stats', event)" data-label="Estatísticas">
+                    <span class="icon">📈</span>
+                    Estatísticas
+                </a>
+                <a href="#lists" class="nav-item" onclick="showSection('lists', event)" data-label="Listas (Block/White)">
+                    <span class="icon">📋</span>
+                    Listas (Block/White)
+                </a>
+                <a href="/settings" class="nav-item" data-label="Configurações">
+                    <span class="icon">⚙️</span>
+                    Configurações
+                </a>
+                <a href="#logs" class="nav-item" onclick="showSection('logs', event)" data-label="Logs">
+                    <span class="icon">📜</span>
+                    Logs
+                </a>
+            </nav>
+            <div class="sidebar-footer">
+                <p class="dashboard-version">v0.01</p>
+                <p class="uptime" id="uptime">Carregando...</p>
+                <p class="powered-by"><a href="https://github.com/leonamp/SPFBL" target="_blank" title="Powered by SPFBL">Powered by SPFBL</a></p>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Header -->
+            <header class="header">
+                <h2 id="page-title">Dashboard</h2>
+                <div class="header-actions">
+                    <span class="last-update">Última atualização: <span id="last-update">--:--</span></span>
+                    <button class="icon-btn" onclick="refreshData()" title="Atualizar dados">
+                        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                            <polyline points="23 4 23 10 17 10"></polyline>
+                            <polyline points="1 20 1 14 7 14"></polyline>
+                            <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"></path>
+                        </svg>
+                    </button>
+                    <button id="theme-toggle" class="icon-btn" onclick="toggleTheme()" title="Alternar tema">
+                        <span id="theme-toggle-icon" class="icon-embed" aria-hidden="true"></span>
+                    </button>
+                </div>
+            </header>
+
+            <!-- Dashboard Section -->
+            <section id="section-dashboard" class="content-section active">
+                <!-- Stats Cards -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon">📧</div>
+                        <div class="stat-info">
+                            <h3>Consultas Hoje</h3>
+                            <p class="stat-value" id="total-queries">--</p>
+                            <span class="stat-trend">--</span>
+                        </div>
+                    </div>
+                    <div class="stat-card success">
+                        <div class="stat-icon">✅</div>
+                        <div class="stat-info">
+                            <h3>Aprovados (PASS)</h3>
+                            <p class="stat-value" id="passed-queries">--</p>
+                            <span class="stat-percentage" id="passed-percent">--%</span>
+                        </div>
+                    </div>
+                    <div class="stat-card danger">
+                        <div class="stat-icon">⛔</div>
+                        <div class="stat-info">
+                            <h3>Bloqueados</h3>
+                            <p class="stat-value" id="blocked-queries">--</p>
+                            <span class="stat-percentage" id="blocked-percent">--%</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">🖥️</div>
+                        <div class="stat-info">
+                            <h3>Clientes Ativos</h3>
+                            <p class="stat-value" id="active-clients">--</p>
+                            <span class="stat-trend">conectados</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">💾</div>
+                        <div class="stat-info">
+                            <h3>Memória do Servidor</h3>
+                            <p class="stat-value" id="memory-percent">--</p>
+                            <span class="stat-trend" id="memory-used">--</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Charts -->
+                <div class="charts-grid">
+                    <div class="chart-card">
+                        <h3>Consultas por Hora (Hoje)</h3>
+                        <canvas id="hourly-chart"></canvas>
+                    </div>
+                    <div class="chart-card">
+                        <h3>Distribuição de Resultados</h3>
+                        <canvas id="results-chart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Recent Activity -->
+                <div class="activity-card">
+                    <h3>Atividade Recente</h3>
+                    <div class="activity-list" id="recent-activity">
+                        <p class="loading">Carregando atividades...</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Queries Section -->
+            <section id="section-queries" class="content-section">
+                <div class="queries-filters">
+                    <input type="text" id="search-queries" placeholder="Buscar por IP, remetente ou destinatário..." class="search-input">
+                    <select id="filter-result" class="filter-select">
+                        <option value="">Todos os resultados</option>
+                        <option value="PASS">PASS</option>
+                        <option value="BLOCKED">BLOCKED</option>
+                        <option value="SOFTFAIL">SOFTFAIL</option>
+                        <option value="FAIL">FAIL</option>
+                    </select>
+                </div>
+                <div class="table-actions">
+                    <button class="btn btn-success" onclick="handleUnblockToken()" title="Desbloquear IP/Domínio/Email">
+                        🔓 Desbloquear
+                    </button>
+                    <button class="btn btn-danger" onclick="handleRemoveFromWhitelist()" title="Remover da Whitelist">
+                        ❌ Remover da Whitelist
+                    </button>
+                </div>
+                <div class="table-container">
+                    <table class="data-table" id="queries-table">
+                        <thead>
+                            <tr>
+                                <th>Horário</th>
+                                <th>IP Origem</th>
+                                <th>Remetente</th>
+                                <th>HELO</th>
+                                <th>Destinatário</th>
+                                <th>Resultado</th>
+                                <th>Ações</th>
+                            </tr>
+                        </thead>
+                        <tbody id="queries-tbody">
+                            <tr><td colspan="7" class="loading">Carregando consultas...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Servers Section -->
+            <section id="section-servers" class="content-section">
+                <div class="section-header">
+                    <h2>Servidores Conectados</h2>
+                    <button class="btn btn-primary btn-add-client" onclick="openAddServerModal()">
+                        + Adicionar Servidor
+                    </button>
+                </div>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th class="select-column">Selecionar</th>
+                                <th>Hostname</th>
+                                <th>IP/CIDR</th>
+                                <th>Tipo</th>
+                                <th>Status</th>
+                                <th>Informações</th>
+                            </tr>
+                        </thead>
+                        <tbody id="servers-tbody">
+                            <tr><td colspan="6" class="loading">Carregando servidores...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="servers-actions">
+                    <button
+                        id="btn-remove-servers"
+                        class="btn btn-danger btn-remove-servers"
+                        type="button"
+                        onclick="handleRemoveServers()"
+                        disabled
+                    >
+                        Remover Servidor
+                    </button>
+                </div>
+            </section>
+
+            <!-- Users Section -->
+            <section id="section-users" class="content-section">
+                <div class="section-header">
+                    <h2>Usuários do Sistema</h2>
+                    <button class="btn btn-primary btn-add-client" onclick="openAddUserModal()">
+                        + Adicionar Usuário
+                    </button>
+                </div>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th class="select-column"></th>
+                                <th>Email</th>
+                                <th>Nome</th>
+                                <th>Status</th>
+                                <th>Ações</th>
+                            </tr>
+                        </thead>
+                        <tbody id="users-tbody">
+                            <tr><td colspan="5" class="loading">Carregando usuários...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Stats Section -->
+            <section id="section-stats" class="content-section">
+                <div class="chart-card large">
+                    <h3>Análise Detalhada - Últimas 24 Horas</h3>
+                    <canvas id="detailed-stats-chart"></canvas>
+                </div>
+                <div class="stats-summary">
+                    <h3>Resumo Estatístico</h3>
+                    <div id="stats-summary-content">
+                        <p class="loading">Carregando estatísticas...</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Lists Section (Block & White) -->
+            <section id="section-lists" class="content-section">
+                <div class="section-header">
+                    <h2>Gerenciamento de Listas</h2>
+                </div>
+
+                <!-- Blacklist -->
+                <div class="list-container">
+                    <div class="list-header">
+                        <h3>🚫 Blacklist (Bloqueados)</h3>
+                        <span class="list-count" id="blocklist-count">0 itens</span>
+                    </div>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Token (IP/Domínio/Email)</th>
+                                    <th>Tipo</th>
+                                    <th>Ações</th>
+                                </tr>
+                            </thead>
+                            <tbody id="blocklist-tbody">
+                                <tr><td colspan="3" class="loading">Carregando blacklist...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Whitelist -->
+                <div class="list-container">
+                    <div class="list-header">
+                        <h3>✅ Whitelist (Permitidos)</h3>
+                        <span class="list-count" id="whitelist-count">0 itens</span>
+                    </div>
+                    <div class="table-container">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Token (IP/Domínio/Email)</th>
+                                    <th>Tipo</th>
+                                    <th>Ações</th>
+                                </tr>
+                            </thead>
+                            <tbody id="whitelist-tbody">
+                                <tr><td colspan="3" class="loading">Carregando whitelist...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Logs Section -->
+            <section id="section-logs" class="content-section">
+                <div class="section-header">
+                    <h2>Logs do SPFBL</h2>
+                    <button class="btn btn-primary btn-refresh" type="button" onclick="refreshLogs()">
+                        🔄 Atualizar
+                    </button>
+                </div>
+
+                <div class="logs-grid">
+                    <div class="logs-card">
+                        <div class="logs-meta">
+                            <h3>Atividade de E-mails</h3>
+                            <div class="logs-meta-row">
+                                <span id="logs-email-file-label" class="logs-file">Arquivo: -</span>
+                            </div>
+                            <span class="logs-hint">Consultas, bloqueios, resultados SPFBL e SMTP</span>
+                        </div>
+                        <div class="logs-container">
+                            <pre id="logs-email-content" class="logs-content"><span class="loading">Carregando logs de e-mail...</span></pre>
+                        </div>
+                    </div>
+
+                    <div class="logs-card">
+                        <div class="logs-meta">
+                            <h3>Atividade de Usuários/Admin</h3>
+                            <div class="logs-meta-row">
+                                <span id="logs-users-file-label" class="logs-file">Arquivo: -</span>
+                            </div>
+                            <span class="logs-hint">Criação de usuários, TOTP, comandos ADMIN</span>
+                        </div>
+                        <div class="logs-container">
+                            <pre id="logs-users-content" class="logs-content"><span class="loading">Carregando logs de usuários...</span></pre>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Modal Adicionar Servidor -->
+    <div id="addServerModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Adicionar Novo Servidor</h2>
+                <span class="close" onclick="closeAddServerModal()">&times;</span>
+            </div>
+            <form id="addServerForm" onsubmit="handleAddServer(event)">
+                <div class="form-group">
+                    <label for="client-ip">Endereço IP ou CIDR *</label>
+                    <input
+                        type="text"
+                        id="client-ip"
+                        name="ip"
+                        required
+                        placeholder="192.168.1.100 ou 192.168.1.0/24"
+                        pattern="^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$"
+                        title="Formato: x.x.x.x ou x.x.x.x/xx"
+                    >
+                    <small>Exemplo: 192.168.1.100 ou 192.168.1.0/24</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="client-domain">Domínio *</label>
+                    <input
+                        type="text"
+                        id="client-domain"
+                        name="domain"
+                        required
+                        placeholder="example.com"
+                        pattern="^[a-zA-Z0-9][a-zA-Z0-9-_.]+[a-zA-Z0-9]$"
+                        title="Formato válido de domínio"
+                    >
+                    <small>Exemplo: mail.example.com</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="client-option">Tipo de Consulta *</label>
+                    <select id="client-option" name="option" required>
+                        <option value="SPFBL" selected>SPFBL (Recomendado)</option>
+                        <option value="DNSBL">DNSBL</option>
+                        <option value="NONE">NONE</option>
+                    </select>
+                    <small>SPFBL: Verificação completa SPF, DKIM, DMARC</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="client-email">Email do Administrador</label>
+                    <input
+                        type="email"
+                        id="client-email"
+                        name="email"
+                        placeholder="admin@example.com"
+                    >
+                    <small>Opcional: Email para notificações</small>
+                </div>
+
+                <div id="modal-error-message" class="error-message" style="display: none;"></div>
+                <div id="modal-success-message" class="success-message" style="display: none;"></div>
+
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-ghost btn-cancel" onclick="closeAddServerModal()">
+                        Cancelar
+                    </button>
+                    <button type="submit" class="btn btn-primary btn-submit" id="btn-submit-server">
+                        Adicionar Servidor
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal Adicionar Usuário -->
+    <div id="addUserModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Adicionar Novo Usuário</h2>
+                <span class="close" onclick="closeAddUserModal()">&times;</span>
+            </div>
+            <form id="addUserForm" onsubmit="handleAddUser(event)">
+                <div class="form-group">
+                    <label for="user-email">Email do Usuário *</label>
+                    <input
+                        type="email"
+                        id="user-email"
+                        name="email"
+                        required
+                        placeholder="usuario@domain.com"
+                        pattern="^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+                        title="Formato válido de email"
+                    >
+                    <small>Este será o login do usuário no painel web</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="user-name">Nome Completo *</label>
+                    <input
+                        type="text"
+                        id="user-name"
+                        name="name"
+                        required
+                        placeholder="João Silva"
+                        minlength="3"
+                        title="Nome completo do usuário"
+                    >
+                    <small>Nome de identificação do usuário</small>
+                </div>
+
+                <div id="user-modal-error-message" class="error-message" style="display: none;"></div>
+                <div id="user-modal-success-message" class="success-message" style="display: none;"></div>
+
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-ghost btn-cancel" onclick="closeAddUserModal()">
+                        Cancelar
+                    </button>
+                    <button type="submit" class="btn btn-primary btn-submit" id="btn-submit-user">
+                        Adicionar Usuário
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="dashboard.js"></script>
+</body>
+</html>

@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SPFBL Dashboard - Login</title>
+    <link rel="stylesheet" href="login.css">
+    <script src="https://www.google.com/recaptcha/api.js" async defer></script>
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-box">
+            <div class="login-header">
+                <img src="/logo.png" alt="Logo SPFBL" style="max-width:280px;max-height:60px;width:auto;height:auto;margin-bottom:1rem;">
+                <p>Painel Administrativo</p>
+            </div>
+
+            <!-- Tela de Login Normal -->
+            <form id="login-form" onsubmit="handleLogin(event)" style="display: block;">
+                <div class="form-group">
+                    <label for="email">Email</label>
+                    <input
+                        type="email"
+                        id="email"
+                        name="email"
+                        required
+                        autocomplete="email"
+                        placeholder="usuario@dominio.com"
+                        maxlength="255"
+                        onblur="checkUserStatus(this.value)"
+                    >
+                </div>
+
+                <div class="form-group">
+                    <label for="password">Senha ou código TOTP</label>
+                    <input
+                        type="password"
+                        id="password"
+                        name="password"
+                        required
+                        autocomplete="current-password"
+                        placeholder="Sua senha ou código TOTP (6 dígitos)"
+                        maxlength="128"
+                    >
+                </div>
+
+                <div id="error-message" class="error-message" style="display: none;"></div>
+
+                <button type="submit" id="login-btn" class="login-btn">
+                    Entrar
+                </button>
+            </form>
+
+            <!-- Tela de Primeiro Acesso (TOTP) -->
+            <div id="first-access-form" style="display: none;">
+                <div class="info-box">
+                    <p class="info-title">Seu e-mail ainda não possui senha TOTP neste sistema</p>
+                    <p class="info-text">Para receber a chave TOTP em seu e-mail, resolva o reCAPTCHA abaixo.</p>
+                </div>
+
+                <input type="hidden" id="totp-email" name="totp-email">
+
+                <div id="error-message-totp" class="error-message" style="display: none;"></div>
+
+                <!-- reCAPTCHA v3 (invisível) ou v2 (visível) -->
+                <div id="recaptcha-container" class="recaptcha-container">
+                    <div class="g-recaptcha" data-sitekey="" id="recaptcha-widget"></div>
+                </div>
+
+                <button type="button" id="send-totp-btn" class="login-btn totp-btn" onclick="handleSendTOTP()">
+                    Enviar TOTP por Email
+                </button>
+
+                <button type="button" class="login-btn back-btn" onclick="backToLogin()">
+                    Voltar ao Login
+                </button>
+
+                <p class="help-text">
+                    Após clicar no botão acima, você receberá um e-mail com o código TOTP.
+                    Use este código na tela de login para acessar o painel.
+                </p>
+            </div>
+
+            <div class="login-footer">
+                <p class="version-info">SPFBL Dashboard v0.01</p>
+            </div>
+        </div>
+
+        <div class="background-animation">
+            <div class="circle circle-1"></div>
+            <div class="circle circle-2"></div>
+            <div class="circle circle-3"></div>
+        </div>
+    </div>
+
+    <script>
+        // Configuração do reCAPTCHA (preencher com a chave real)
+        let RECAPTCHA_SITE_KEY = '';
+
+        // Carregar configuração de reCAPTCHA do servidor
+        async function loadRecaptchaConfig() {
+            try {
+                // Tentar carregar do meta tag ou variável de configuração
+                const metaTag = document.querySelector('meta[name="recaptcha-site-key"]');
+                if (metaTag) {
+                    RECAPTCHA_SITE_KEY = metaTag.getAttribute('content');
+                }
+
+                // Se não encontrou, pode estar em window.RECAPTCHA_SITE_KEY
+                if (!RECAPTCHA_SITE_KEY && window.RECAPTCHA_SITE_KEY) {
+                    RECAPTCHA_SITE_KEY = window.RECAPTCHA_SITE_KEY;
+                }
+
+                // Atualizar o widget
+                if (RECAPTCHA_SITE_KEY) {
+                    document.getElementById('recaptcha-widget').setAttribute('data-sitekey', RECAPTCHA_SITE_KEY);
+                    if (window.grecaptcha) {
+                        window.grecaptcha.render('recaptcha-widget', {
+                            'sitekey': RECAPTCHA_SITE_KEY,
+                            'callback': 'onRecaptchaSuccess'
+                        });
+                    }
+                }
+            } catch (error) {
+                console.error('Error loading reCAPTCHA config:', error);
+            }
+        }
+
+        function onRecaptchaSuccess() {
+            // reCAPTCHA resolvido com sucesso
+            document.getElementById('send-totp-btn').disabled = false;
+        }
+
+        async function handleLogin(event) {
+            event.preventDefault();
+
+            const emailInput = document.getElementById('email');
+            const passwordInput = document.getElementById('password');
+            const errorDiv = document.getElementById('error-message');
+            const loginBtn = document.getElementById('login-btn');
+
+            // Limpar mensagem de erro anterior
+            errorDiv.style.display = 'none';
+            errorDiv.textContent = '';
+
+            // Sanitizar inputs
+            const email = emailInput.value.trim();
+            const password = passwordInput.value.trim();
+
+            // Validação básica
+            if (!email || !password) {
+                showError('Por favor, preencha email e senha ou código TOTP');
+                return;
+            }
+
+            // Validar formato de email
+            const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+            if (!emailRegex.test(email)) {
+                showError('Formato de email inválido');
+                return;
+            }
+
+            // Desabilitar botão durante requisição
+            loginBtn.disabled = true;
+            loginBtn.textContent = 'Entrando...';
+
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    credentials: 'include',
+                    body: JSON.stringify({ email, password })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    // Login bem-sucedido
+                    showSuccess('Login realizado com sucesso! Redirecionando...');
+
+                    // Limpar campos
+                    emailInput.value = '';
+                    passwordInput.value = '';
+
+                    // Redirecionar para dashboard
+                    setTimeout(() => {
+                        window.location.href = '/dashboard.html';
+                    }, 1000);
+                } else {
+                    // Login falhou
+                    let errorMsg = data.error || 'Credenciais inválidas';
+
+                    if (data.remaining_attempts !== undefined) {
+                        errorMsg += ` (${data.remaining_attempts} tentativas restantes)`;
+                    }
+
+                    if (response.status === 429) {
+                        errorMsg = 'Muitas tentativas de login. Tente novamente mais tarde.';
+                    }
+
+                    showError(errorMsg);
+
+                    // Limpar senha
+                    passwordInput.value = '';
+                    passwordInput.focus();
+                }
+            } catch (error) {
+                showError('Erro ao conectar ao servidor. Tente novamente.');
+                console.error('Login error:', error);
+            } finally {
+                // Reabilitar botão
+                loginBtn.disabled = false;
+                loginBtn.textContent = 'Entrar';
+            }
+        }
+
+        async function checkUserStatus(email) {
+            if (!email || email.trim() === '') {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/user/check-status?email=${encodeURIComponent(email)}`);
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    if (!data.has_totp) {
+                        // Usuário não tem TOTP, mostrar tela de primeiro acesso
+                        showFirstAccessForm(email);
+                    }
+                }
+            } catch (error) {
+                console.error('Error checking user status:', error);
+                // Silenciosamente ignorar erros de verificação
+            }
+        }
+
+        function showFirstAccessForm(email) {
+            document.getElementById('login-form').style.display = 'none';
+            document.getElementById('first-access-form').style.display = 'block';
+            document.getElementById('totp-email').value = email;
+
+            // Reinicializar reCAPTCHA
+            if (window.grecaptcha && RECAPTCHA_SITE_KEY) {
+                window.grecaptcha.reset();
+            }
+        }
+
+        function backToLogin() {
+            document.getElementById('first-access-form').style.display = 'none';
+            document.getElementById('login-form').style.display = 'block';
+            document.getElementById('email').value = document.getElementById('totp-email').value;
+            document.getElementById('email').focus();
+        }
+
+        async function handleSendTOTP() {
+            const email = document.getElementById('totp-email').value;
+            const errorDiv = document.getElementById('error-message-totp');
+            const sendBtn = document.getElementById('send-totp-btn');
+
+            errorDiv.style.display = 'none';
+            errorDiv.textContent = '';
+
+            if (!email) {
+                showErrorTotp('Email não fornecido');
+                return;
+            }
+
+            // Obter token do reCAPTCHA
+            let recaptchaToken = '';
+            if (window.grecaptcha && RECAPTCHA_SITE_KEY) {
+                recaptchaToken = window.grecaptcha.getResponse();
+                if (!recaptchaToken) {
+                    showErrorTotp('Por favor, complete o reCAPTCHA');
+                    return;
+                }
+            }
+
+            sendBtn.disabled = true;
+            sendBtn.textContent = 'Enviando...';
+
+            try {
+                const response = await fetch('/api/user/request-totp', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    credentials: 'include',
+                    body: JSON.stringify({
+                        email: email,
+                        recaptcha_token: recaptchaToken
+                    })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    showSuccessTotp(data.message || 'TOTP enviado com sucesso! Verifique seu email.');
+
+                    // Após 3 segundos, voltar ao login
+                    setTimeout(() => {
+                        backToLogin();
+                        showSuccess('Verifique seu email e faça login com o código TOTP');
+                    }, 3000);
+                } else {
+                    showErrorTotp(data.error || 'Erro ao enviar TOTP');
+                }
+            } catch (error) {
+                showErrorTotp('Erro ao enviar TOTP. Tente novamente.');
+                console.error('Send TOTP error:', error);
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.textContent = 'Enviar TOTP por Email';
+            }
+        }
+
+        function showError(message) {
+            const errorDiv = document.getElementById('error-message');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            errorDiv.className = 'error-message error';
+        }
+
+        function showErrorTotp(message) {
+            const errorDiv = document.getElementById('error-message-totp');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            errorDiv.className = 'error-message error';
+        }
+
+        function showSuccess(message) {
+            const errorDiv = document.getElementById('error-message');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            errorDiv.className = 'error-message success';
+        }
+
+        function showSuccessTotp(message) {
+            const errorDiv = document.getElementById('error-message-totp');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            errorDiv.className = 'error-message success';
+        }
+
+        // Verificar se já está autenticado
+        window.addEventListener('DOMContentLoaded', async () => {
+            // Carregar configuração de reCAPTCHA
+            loadRecaptchaConfig();
+
+            try {
+                const response = await fetch('/api/user', {
+                    credentials: 'include'
+                });
+
+                if (response.ok) {
+                    // Já está autenticado, redirecionar
+                    window.location.href = '/dashboard.html';
+                }
+            } catch (error) {
+                // Ignorar erro - usuário não está autenticado
+            }
+        });
+
+        // Prevenir ataques de força bruta com delay
+        let loginAttempts = 0;
+        const originalSubmit = handleLogin;
+
+        function rateLimitedLogin(event) {
+            if (loginAttempts > 3) {
+                const delay = Math.min(loginAttempts * 1000, 10000);
+                showError(`Aguarde ${delay / 1000} segundos antes de tentar novamente`);
+                setTimeout(() => {
+                    loginAttempts = 0;
+                }, delay);
+                event.preventDefault();
+                return;
+            }
+
+            loginAttempts++;
+            originalSubmit(event);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+[Unit]
+Description=SPFBL Dashboard API
+After=network.target spfbl.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/spfbl
+ExecStart=/usr/bin/python3 /opt/spfbl/spfbl-api.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
