@@ -15,7 +15,7 @@ Então vai executar o script
 ```
 OBS: A pasta newdash deve estar no mesmo local do script.
 
-Após a instalação, um arquivo txt será criado na mesma pasta onde executou o script e nele terá um comando que será executado no servidor directadmin que vai instalar o spfbl e configurar o exim para enviar as respostas para esse servidor onde foi feito a instalação do script inicia.
+Após a instalação, um arquivo txt será criado na mesma pasta onde executou o script e nele terá um comando que será executado no servidor directadmin que vai instalar o spfbl e configurar o exim para enviar as respostas para esse servidor onde foi feito a instalação do script inicial.
 
 ### Características Principais da Instalação
 
@@ -36,7 +36,7 @@ Os usuários podem ser cadastrados via painel.
 
 Feito isso, o painel de controle pode ser acessado pela URL:
 
-http://<hostname>:8002/login
+http://hostname:8002/login
 
 Na primeira vez que o usuário entrar nesta URL, digitar o email e clicar no campo senha, o SPFBL iniciará um processo de cadastro TOTP, enviando um e-mail para o usuário com o QRcode contendo o segredo TOPT dele.
 
