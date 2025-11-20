@@ -1099,7 +1099,8 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 count = 0
                 for line in reversed(lines):
                     if 'SPF' in line and '=>' in line and count < 100:
-                        match = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+\+\d+).*SPF.*\'(.+?)\'.*\'(.+?)\'.*\'(.+?)\'.*\'(.+?)\'.*=> (\w+)', line)
+                        # Corrigido: [+-] ao invés de \+ para aceitar timezones negativos (ex: -0300)
+                        match = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[+-]\d+).*SPF.*\'(.+?)\'.*\'(.+?)\'.*\'(.+?)\'.*\'(.+?)\'.*=> (\w+)', line)
                         if match:
                             timestamp, ip, sender, helo, recipient, result = match.groups()
                             queries.append({
