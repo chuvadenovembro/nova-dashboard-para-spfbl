@@ -18,10 +18,10 @@ umask 022
 
 # Domínio principal do servidor de email
 # Exemplo: "meudominio.com" ou "empresa.com.br"
-MAIL_DOMAIN="example.com"
+MAIL_DOMAIN="3iatlas.privatedns.com.br"
 
 # Hostname do servidor (deixe vazio para detecção automática)
-MAIL_HOSTNAME=""
+MAIL_HOSTNAME="3iatlas.privatedns.com.br"
 
 # ===================================================================
 # ACESSO À DASHBOARD - CREDENCIAIS DE ADMINISTRADOR
@@ -30,13 +30,13 @@ MAIL_HOSTNAME=""
 # Email do administrador do SPFBL
 # Este será o login para acessar o painel de administração
 # Exemplo: "admin@meudominio.com" ou "suporte@empresa.com.br"
-SPFBL_ADMIN_EMAIL="spfbl@example.com"
+SPFBL_ADMIN_EMAIL="admin@ogigante.com"
 
 # Senha do administrador da dashboard
 # IMPORTANTE: Altere esta senha! Use uma senha forte e segura.
 # Exemplo: "MinhaS3nh@F0rt3!" ou "P@ssw0rd!2025"
 # ATENÇÃO: Esta senha será usada para login no painel web!
-SPFBL_ADMIN_PASSWORD="TroqueEssaSenha123!"
+SPFBL_ADMIN_PASSWORD="hrp4CKV_wxz5gfc!ehbvbk!pzt6QUZ7unx9ecf"
 
 # ===================================================================
 # CONFIGURAÇÕES DE REDE E PORTAS
@@ -1610,6 +1610,49 @@ detect_my_ip() {
   echo "$public_ip"
 }
 
+configure_csf_firewall() {
+  # Ajusta o CSF no servidor DirectAdmin para liberar as portas do SPFBL
+  local conf="/etc/csf/csf.conf"
+  if [[ ! -f "$conf" ]]; then
+    log "CSF não encontrado neste servidor (continuando sem ajustes de firewall)."
+    return 0
+  fi
+
+  local changed=0
+
+  add_port() {
+    local key="$1" port="$2"
+    [[ -z "$port" ]] && return
+    local current new
+    current=$(grep -E "^${key}[[:space:]]*=" "$conf" | head -1 | sed -E 's/^.*= *"?([^"]*)"?.*/\1/' | tr -d ' ')
+    # Se já contém a porta, nada a fazer
+    if [[ ",${current}," == *",${port},"* ]]; then
+      return
+    fi
+    new="${current:+${current},}${port}"
+    sed -i "s/^${key}[[:space:]]*=.*/${key} = \"${new}\"/" "$conf"
+    changed=1
+  }
+
+  # Liberar saídas para as portas usadas pelo SPFBL (IPv4/IPv6)
+  add_port "TCP_OUT" "$SPFBL_POLICY_PORT"
+  add_port "TCP_OUT" "$SPFBL_HTTP_PORT"
+  add_port "TCP_OUT" "$SPFBL_ADMIN_PORT"
+  add_port "TCP6_OUT" "$SPFBL_POLICY_PORT"
+  add_port "TCP6_OUT" "$SPFBL_HTTP_PORT"
+  add_port "TCP6_OUT" "$SPFBL_ADMIN_PORT"
+
+  if [[ $changed -eq 1 ]]; then
+    if csf -r >/dev/null 2>&1; then
+      log "✓ CSF atualizado para liberar as portas $SPFBL_POLICY_PORT, $SPFBL_HTTP_PORT e $SPFBL_ADMIN_PORT (saída)."
+    else
+      log "⚠ CSF não pôde ser recarregado automaticamente; verifique manualmente."
+    fi
+  else
+    log "✓ CSF já possuía as portas do SPFBL liberadas."
+  fi
+}
+
 ###############################
 # Verificações
 ###############################
@@ -1643,6 +1686,9 @@ fi
 
 log "✓ Dependências instaladas"
 
+# Liberar portas no CSF (caso esteja em uso no DirectAdmin)
+configure_csf_firewall
+
 # Testar conectividade
 log "Testando conectividade com servidor SPFBL..."
 if ! timeout 3 bash -c "echo '' | nc -w 1 $SPFBL_SERVER $SPFBL_POLICY_PORT" >/dev/null 2>&1; then
@@ -1668,10 +1714,13 @@ sed -i "s|^PORTA_ADMIN=.*|PORTA_ADMIN=\"$SPFBL_ADMIN_PORT\"|" /usr/local/bin/spf
 log "Testando cliente SPFBL..."
 result=$(/usr/local/bin/spfbl query 8.8.8.8 teste@gmail.com google.com destinatario@teste.com 2>&1 || true)
 
-if [[ "$result" =~ (PASS|NEUTRAL|NONE|WHITE|LISTED|GREYLIST) ]]; then
+# Todas as respostas válidas do SPFBL (incluindo SOFTFAIL, FAIL, etc.)
+if [[ "$result" =~ ^(PASS|FAIL|SOFTFAIL|NEUTRAL|NONE|WHITE|LISTED|GREYLIST|BLOCKED|BANNED|FLAG|SPAMTRAP|HOLD) ]]; then
   log "✓ Cliente SPFBL funcionando: $result"
+elif [[ -z "$result" ]]; then
+  log "⚠ AVISO: Cliente SPFBL não retornou resposta (possível erro de conectividade)"
 else
-  log "⚠ AVISO: Resposta inesperada: $result"
+  log "⚠ AVISO: Resposta inesperada do SPFBL: $result"
 fi
 
 # Auto-registrar este servidor no SPFBL
