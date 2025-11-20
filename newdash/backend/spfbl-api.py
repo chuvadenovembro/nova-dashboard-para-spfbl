@@ -750,28 +750,9 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             if self.verify_against_config(email, password):
                 return True
 
-            # SEGUNDO: Se falhou, tentar autenticar via comando ADMIN do SPFBL
-            # Conectar na porta admin e tentar executar comando que requer autenticação
-            import socket
-
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(3)
-                sock.connect(('localhost', 9875))
-
-                # Enviar comando de autenticação
-                auth_cmd = f"USER {email} {password}\n"
-                sock.send(auth_cmd.encode())
-
-                response = sock.recv(1024).decode()
-                sock.close()
-
-                # Se conseguiu conectar e enviar comando, assume sucesso
+            # SEGUNDO: Tentar autenticar via painel HTTP original (senha normal)
+            if self.verify_password_with_spfbl(email, password):
                 return True
-
-            except:
-                # Se não conseguiu autenticar via socket, falha
-                return False
 
         except Exception:
             return False
@@ -815,6 +796,49 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
         # Verificar se é o painel de controle (PT ou EN)
         if "Painel de controle do SPFBL" in html or "SPFBL control panel" in html:
+            return True
+
+        return False
+
+    def verify_password_with_spfbl(self, email, password):
+        """Verify password using the legacy SPFBL HTTP login (same endpoint usado para TOTP).
+
+        Fluxo:
+        1. POST http://127.0.0.1:8001/<email> com body password=<senha>
+        2. GET a mesma URL com o cookie retornado
+        3. Considera autenticado se a resposta contiver o painel de controle
+        """
+        base_url = os.environ.get('SPFBL_PANEL_URL', 'http://127.0.0.1:8001')
+
+        try:
+            parsed = urllib.parse.urlparse(base_url)
+            if not parsed.scheme:
+                base_url = 'http://' + base_url
+        except Exception:
+            base_url = 'http://127.0.0.1:8001'
+
+        email_path = '/' + urllib.parse.quote(email)
+
+        cookie_jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+        opener.addheaders = [
+            ('User-Agent', 'spfbl-dashboard/2.0'),
+        ]
+
+        try:
+            # 1) Submeter senha via POST (como o painel legado)
+            payload = urllib.parse.urlencode({'password': password}).encode('utf-8')
+            opener.open(f"{base_url}{email_path}", data=payload, timeout=3)
+
+            # 2) Requisitar painel com o cookie retornado
+            panel_resp = opener.open(f"{base_url}{email_path}", timeout=3)
+            html = panel_resp.read().decode('utf-8', errors='ignore')
+        except Exception:
+            return False
+
+        # Verificar se é o painel de controle (PT ou EN)
+        html_lower = html.lower()
+        if "painel de controle do spfbl" in html_lower or "spfbl control panel" in html_lower:
             return True
 
         return False

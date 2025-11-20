@@ -54,8 +54,8 @@
             <!-- Tela de Primeiro Acesso (TOTP) -->
             <div id="first-access-form" style="display: none;">
                 <div class="info-box">
-                    <p class="info-title">Seu e-mail ainda não possui senha TOTP neste sistema</p>
-                    <p class="info-text">Para receber a chave TOTP em seu e-mail, resolva o reCAPTCHA abaixo.</p>
+                    <p class="info-title">Seu e-mail ainda não possui TOTP cadastrado</p>
+                    <p class="info-text">Peça o código pelo botão abaixo e depois digite-o no campo "Senha ou código TOTP" para entrar.</p>
                 </div>
 
                 <input type="hidden" id="totp-email" name="totp-email">
@@ -72,12 +72,11 @@
                 </button>
 
                 <button type="button" class="login-btn back-btn" onclick="backToLogin()">
-                    Voltar ao Login
+                    Ocultar reenvio de código
                 </button>
 
                 <p class="help-text">
-                    Após clicar no botão acima, você receberá um e-mail com o código TOTP.
-                    Use este código na tela de login para acessar o painel.
+                    Essa etapa não bloqueia o login. Basta solicitar o código e informá-lo no campo de senha/código TOTP.
                 </p>
             </div>
 
@@ -229,6 +228,8 @@
                     if (!data.has_totp) {
                         // Usuário não tem TOTP, mostrar tela de primeiro acesso
                         showFirstAccessForm(email);
+                    } else {
+                        hideFirstAccessForm();
                     }
                 }
             } catch (error) {
@@ -238,11 +239,12 @@
         }
 
         function showFirstAccessForm(email) {
-            document.getElementById('login-form').style.display = 'none';
-            document.getElementById('first-access-form').style.display = 'block';
+            const totpForm = document.getElementById('first-access-form');
+            document.getElementById('login-form').style.display = 'block';
+            totpForm.style.display = 'block';
             document.getElementById('totp-email').value = email;
 
-            // Reinicializar reCAPTCHA
+            // Mantém o login disponível enquanto exibe a opção de reenvio
             if (window.grecaptcha && RECAPTCHA_SITE_KEY) {
                 window.grecaptcha.reset();
             }
@@ -250,9 +252,12 @@
 
         function backToLogin() {
             document.getElementById('first-access-form').style.display = 'none';
-            document.getElementById('login-form').style.display = 'block';
             document.getElementById('email').value = document.getElementById('totp-email').value;
-            document.getElementById('email').focus();
+            document.getElementById('password').focus();
+        }
+
+        function hideFirstAccessForm() {
+            document.getElementById('first-access-form').style.display = 'none';
         }
 
         async function handleSendTOTP() {
@@ -298,12 +303,8 @@
 
                 if (response.ok && data.success) {
                     showSuccessTotp(data.message || 'TOTP enviado com sucesso! Verifique seu email.');
-
-                    // Após 3 segundos, voltar ao login
-                    setTimeout(() => {
-                        backToLogin();
-                        showSuccess('Verifique seu email e faça login com o código TOTP');
-                    }, 3000);
+                    showSuccess('Código enviado. Digite o TOTP recebido no campo "Senha ou código TOTP".');
+                    document.getElementById('password').focus();
                 } else {
                     showErrorTotp(data.error || 'Erro ao enviar TOTP');
                 }
