@@ -18,10 +18,16 @@ umask 022
 
 # Domínio principal do servidor de email
 # Exemplo: "meudominio.com" ou "empresa.com.br"
-MAIL_DOMAIN="example.com"
+MAIL_DOMAIN=""
 
 # Hostname do servidor (deixe vazio para detecção automática)
 MAIL_HOSTNAME=""
+
+# ===================================================================
+# CONTROLE DE VERSÃO DA DASHBOARD
+# ===================================================================
+# Valor padrão usado apenas caso não seja possível detectar no CHANGELOG.
+DASHBOARD_VERSION="0.00"
 
 # ===================================================================
 # ACESSO À DASHBOARD - CREDENCIAIS DE ADMINISTRADOR
@@ -176,6 +182,15 @@ IS_PRIVATE_NETWORK=""
 DETECTED_HOSTNAME=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
+CHANGELOG_FILE="$SCRIPT_DIR/CHANGELOG.md"
+
+# Detecta automaticamente a versão mais recente registrada no CHANGELOG.
+if [[ -f "$CHANGELOG_FILE" ]]; then
+  latest_tag="$(sed -n 's/^## \[v\([0-9][0-9\.]*\)\].*/\1/p' "$CHANGELOG_FILE" | head -n1)"
+  if [[ -n "$latest_tag" ]]; then
+    DASHBOARD_VERSION="$latest_tag"
+  fi
+fi
 
 ###############################
 # Funções utilitárias
@@ -640,6 +655,7 @@ install_new_dashboard() {
   local src_backend="$src_base/backend"
   local src_frontend="$src_base/frontend"
   local src_systemd="$src_base/systemd"
+  local dashboard_version="${DASHBOARD_VERSION:-0.00}"
 
   # Verificar se os arquivos mínimos necessários existem no pacote de instalação
   if [[ ! -f "$src_backend/spfbl-api.py" ]]; then
@@ -669,6 +685,9 @@ install_new_dashboard() {
 
   # Copiar frontend (todo o conteúdo de frontend/)
   cp -a "$src_frontend/." "$SPFBL_WEB_DIR/"
+
+  # Gravar arquivo de versão usado pela interface
+  printf '%s\n' "$dashboard_version" > "$SPFBL_WEB_DIR/version.txt"
 
   # Configurar serviço systemd da API da dashboard, se disponível
   if [[ -f "$src_systemd/spfbl-api.service" ]]; then
@@ -1610,6 +1629,49 @@ detect_my_ip() {
   echo "$public_ip"
 }
 
+configure_csf_firewall() {
+  # Ajusta o CSF no servidor DirectAdmin para liberar as portas do SPFBL
+  local conf="/etc/csf/csf.conf"
+  if [[ ! -f "$conf" ]]; then
+    log "CSF não encontrado neste servidor (continuando sem ajustes de firewall)."
+    return 0
+  fi
+
+  local changed=0
+
+  add_port() {
+    local key="$1" port="$2"
+    [[ -z "$port" ]] && return
+    local current new
+    current=$(grep -E "^${key}[[:space:]]*=" "$conf" | head -1 | sed -E 's/^.*= *"?([^"]*)"?.*/\1/' | tr -d ' ')
+    # Se já contém a porta, nada a fazer
+    if [[ ",${current}," == *",${port},"* ]]; then
+      return
+    fi
+    new="${current:+${current},}${port}"
+    sed -i "s/^${key}[[:space:]]*=.*/${key} = \"${new}\"/" "$conf"
+    changed=1
+  }
+
+  # Liberar saídas para as portas usadas pelo SPFBL (IPv4/IPv6)
+  add_port "TCP_OUT" "$SPFBL_POLICY_PORT"
+  add_port "TCP_OUT" "$SPFBL_HTTP_PORT"
+  add_port "TCP_OUT" "$SPFBL_ADMIN_PORT"
+  add_port "TCP6_OUT" "$SPFBL_POLICY_PORT"
+  add_port "TCP6_OUT" "$SPFBL_HTTP_PORT"
+  add_port "TCP6_OUT" "$SPFBL_ADMIN_PORT"
+
+  if [[ $changed -eq 1 ]]; then
+    if csf -r >/dev/null 2>&1; then
+      log "✓ CSF atualizado para liberar as portas $SPFBL_POLICY_PORT, $SPFBL_HTTP_PORT e $SPFBL_ADMIN_PORT (saída)."
+    else
+      log "⚠ CSF não pôde ser recarregado automaticamente; verifique manualmente."
+    fi
+  else
+    log "✓ CSF já possuía as portas do SPFBL liberadas."
+  fi
+}
+
 ###############################
 # Verificações
 ###############################
@@ -1643,6 +1705,9 @@ fi
 
 log "✓ Dependências instaladas"
 
+# Liberar portas no CSF (caso esteja em uso no DirectAdmin)
+configure_csf_firewall
+
 # Testar conectividade
 log "Testando conectividade com servidor SPFBL..."
 if ! timeout 3 bash -c "echo '' | nc -w 1 $SPFBL_SERVER $SPFBL_POLICY_PORT" >/dev/null 2>&1; then
@@ -1668,10 +1733,13 @@ sed -i "s|^PORTA_ADMIN=.*|PORTA_ADMIN=\"$SPFBL_ADMIN_PORT\"|" /usr/local/bin/spf
 log "Testando cliente SPFBL..."
 result=$(/usr/local/bin/spfbl query 8.8.8.8 teste@gmail.com google.com destinatario@teste.com 2>&1 || true)
 
-if [[ "$result" =~ (PASS|NEUTRAL|NONE|WHITE|LISTED|GREYLIST) ]]; then
+# Todas as respostas válidas do SPFBL (incluindo SOFTFAIL, FAIL, etc.)
+if [[ "$result" =~ ^(PASS|FAIL|SOFTFAIL|NEUTRAL|NONE|WHITE|LISTED|GREYLIST|BLOCKED|BANNED|FLAG|SPAMTRAP|HOLD) ]]; then
   log "✓ Cliente SPFBL funcionando: $result"
+elif [[ -z "$result" ]]; then
+  log "⚠ AVISO: Cliente SPFBL não retornou resposta (possível erro de conectividade)"
 else
-  log "⚠ AVISO: Resposta inesperada: $result"
+  log "⚠ AVISO: Resposta inesperada do SPFBL: $result"
 fi
 
 # Auto-registrar este servidor no SPFBL

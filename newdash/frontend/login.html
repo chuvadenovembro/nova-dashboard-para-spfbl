@@ -5,7 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SPFBL Dashboard - Login</title>
     <link rel="stylesheet" href="login.css">
-    <script src="https://www.google.com/recaptcha/api.js" async defer></script>
+    <script src="version.js" defer></script>
+    <script src="https://www.google.com/recaptcha/api.js?onload=onRecaptchaLoad&render=explicit" async defer></script>
 </head>
 <body>
     <div class="login-container">
@@ -81,7 +82,7 @@
             </div>
 
             <div class="login-footer">
-                <p class="version-info">SPFBL Dashboard v0.01</p>
+                <p class="version-info">SPFBL Dashboard <span data-dashboard-version>v0.00</span></p>
             </div>
         </div>
 
@@ -93,35 +94,101 @@
     </div>
 
     <script>
-        // Configuração do reCAPTCHA (preencher com a chave real)
+        // Configuração do reCAPTCHA (carregada do servidor)
         let RECAPTCHA_SITE_KEY = '';
+        let RECAPTCHA_ENABLED = false;
+        let recaptchaReady = false;
+
+        // Callback chamado quando o reCAPTCHA estiver pronto
+        function onRecaptchaLoad() {
+            recaptchaReady = true;
+            renderRecaptchaWidget();
+        }
+
+        // Renderizar widget do reCAPTCHA
+        function renderRecaptchaWidget() {
+            // Verificar se reCAPTCHA está habilitado
+            if (!RECAPTCHA_ENABLED || !RECAPTCHA_SITE_KEY) {
+                console.log('reCAPTCHA: Desabilitado ou sem chave');
+                return;
+            }
+
+            const recaptchaWidget = document.getElementById('recaptcha-widget');
+            const recaptchaContainer = document.getElementById('recaptcha-container');
+
+            // Verificar se o grecaptcha está disponível
+            if (typeof grecaptcha === 'undefined' || !grecaptcha.render) {
+                console.log('reCAPTCHA: Script do Google ainda não carregou, tentando novamente em 500ms...');
+                // Tentar novamente após 500ms
+                setTimeout(renderRecaptchaWidget, 500);
+                return;
+            }
+
+            if (recaptchaWidget) {
+                try {
+                    // Verificar se já foi renderizado
+                    if (recaptchaWidget.innerHTML.trim() === '' || !recaptchaWidget.querySelector('iframe')) {
+                        console.log('reCAPTCHA: Renderizando widget com chave:', RECAPTCHA_SITE_KEY.substring(0, 20) + '...');
+                        grecaptcha.render('recaptcha-widget', {
+                            'sitekey': RECAPTCHA_SITE_KEY
+                        });
+                        if (recaptchaContainer) {
+                            recaptchaContainer.style.display = 'block';
+                            console.log('reCAPTCHA: Widget renderizado e visível');
+                        }
+                    } else {
+                        console.log('reCAPTCHA: Widget já renderizado, apenas exibindo');
+                        if (recaptchaContainer) {
+                            recaptchaContainer.style.display = 'block';
+                        }
+                    }
+                } catch (e) {
+                    console.error('reCAPTCHA: Erro ao renderizar:', e.message);
+                }
+            } else {
+                console.error('reCAPTCHA: Elemento recaptcha-widget não encontrado');
+            }
+        }
 
         // Carregar configuração de reCAPTCHA do servidor
         async function loadRecaptchaConfig() {
             try {
-                // Tentar carregar do meta tag ou variável de configuração
-                const metaTag = document.querySelector('meta[name="recaptcha-site-key"]');
-                if (metaTag) {
-                    RECAPTCHA_SITE_KEY = metaTag.getAttribute('content');
-                }
+                // Buscar configuração do endpoint do backend
+                const response = await fetch('/api/config/recaptcha');
+                if (response.ok) {
+                    const config = await response.json();
+                    RECAPTCHA_ENABLED = config.enabled;
+                    RECAPTCHA_SITE_KEY = config.site_key;
 
-                // Se não encontrou, pode estar em window.RECAPTCHA_SITE_KEY
-                if (!RECAPTCHA_SITE_KEY && window.RECAPTCHA_SITE_KEY) {
-                    RECAPTCHA_SITE_KEY = window.RECAPTCHA_SITE_KEY;
-                }
+                    if (RECAPTCHA_ENABLED && RECAPTCHA_SITE_KEY) {
+                        // Configurar widget v2 (checkbox visível)
+                        const recaptchaWidget = document.getElementById('recaptcha-widget');
+                        if (recaptchaWidget) {
+                            recaptchaWidget.setAttribute('data-sitekey', RECAPTCHA_SITE_KEY);
+                        }
 
-                // Atualizar o widget
-                if (RECAPTCHA_SITE_KEY) {
-                    document.getElementById('recaptcha-widget').setAttribute('data-sitekey', RECAPTCHA_SITE_KEY);
-                    if (window.grecaptcha) {
-                        window.grecaptcha.render('recaptcha-widget', {
-                            'sitekey': RECAPTCHA_SITE_KEY,
-                            'callback': 'onRecaptchaSuccess'
-                        });
+                        // Tentar renderizar (se grecaptcha já estiver carregado)
+                        if (typeof grecaptcha !== 'undefined' && grecaptcha.render) {
+                            recaptchaReady = true;
+                            renderRecaptchaWidget();
+                        }
+                        // Caso contrário, onRecaptchaLoad() será chamado quando carregar
+                    } else {
+                        // reCAPTCHA desabilitado, ocultar container
+                        const recaptchaContainer = document.getElementById('recaptcha-container');
+                        if (recaptchaContainer) {
+                            recaptchaContainer.style.display = 'none';
+                        }
                     }
                 }
             } catch (error) {
                 console.error('Error loading reCAPTCHA config:', error);
+                // Se falhar, assumir que reCAPTCHA está desabilitado
+                RECAPTCHA_ENABLED = false;
+                const recaptchaContainer = document.getElementById('recaptcha-container');
+                if (recaptchaContainer) {
+                    recaptchaContainer.style.display = 'none';
+                }
             }
         }
 
@@ -244,9 +311,18 @@
             totpForm.style.display = 'block';
             document.getElementById('totp-email').value = email;
 
-            // Mantém o login disponível enquanto exibe a opção de reenvio
-            if (window.grecaptcha && RECAPTCHA_SITE_KEY) {
-                window.grecaptcha.reset();
+            // Renderizar reCAPTCHA quando o modal for exibido
+            if (RECAPTCHA_ENABLED && RECAPTCHA_SITE_KEY) {
+                // Aguardar um pouco para garantir que o modal está visível
+                setTimeout(() => {
+                    renderRecaptchaWidget();
+                }, 100);
+            } else {
+                // reCAPTCHA desabilitado, ocultar container
+                const recaptchaContainer = document.getElementById('recaptcha-container');
+                if (recaptchaContainer) {
+                    recaptchaContainer.style.display = 'none';
+                }
             }
         }
 
@@ -273,15 +349,24 @@
                 return;
             }
 
-            // Obter token do reCAPTCHA
+            // Obter token do reCAPTCHA v2 (somente se habilitado)
             let recaptchaToken = '';
-            if (window.grecaptcha && RECAPTCHA_SITE_KEY) {
-                recaptchaToken = window.grecaptcha.getResponse();
+            if (RECAPTCHA_ENABLED && RECAPTCHA_SITE_KEY) {
+                // reCAPTCHA está habilitado, obter resposta do widget v2
+                if (window.grecaptcha) {
+                    try {
+                        recaptchaToken = grecaptcha.getResponse();
+                    } catch (error) {
+                        console.error('Error getting reCAPTCHA token:', error);
+                    }
+                }
+
                 if (!recaptchaToken) {
-                    showErrorTotp('Por favor, complete o reCAPTCHA');
+                    showErrorTotp('Por favor, complete o reCAPTCHA marcando a caixa "Não sou um robô"');
                     return;
                 }
             }
+            // Se reCAPTCHA não está habilitado, recaptchaToken fica vazio e backend permite
 
             sendBtn.disabled = true;
             sendBtn.textContent = 'Enviando...';

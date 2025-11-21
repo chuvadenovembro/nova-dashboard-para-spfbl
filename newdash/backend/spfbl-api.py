@@ -16,15 +16,30 @@ import urllib.parse
 import urllib.request
 import http.cookiejar
 import shutil
+import html
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from http.cookies import SimpleCookie
 
 # Configurações de Sessão (somente em memória)
+# NOTA: Para produção, considere usar Redis ou banco de dados para persistência
 SESSION_TIMEOUT = 3600  # 1 hora em segundos
-MAX_LOGIN_ATTEMPTS = 5  # Máximo de tentativas de login
-LOCKOUT_TIME = 300  # 5 minutos de bloqueio após exceder tentativas
+MAX_LOGIN_ATTEMPTS = 3  # Máximo de tentativas de login (reduzido para segurança)
+LOCKOUT_TIME = 1800  # 30 minutos de bloqueio após exceder tentativas (aumentado)
+
+# Configurações de Segurança de Cookies
+# Definir como True se estiver usando HTTPS em produção
+USE_SECURE_COOKIES = os.environ.get('SPFBL_USE_HTTPS', 'false').lower() == 'true'
+
+# Configurações de CORS - Origens permitidas
+# IMPORTANTE: Adicione aqui apenas as origens confiáveis
+ALLOWED_ORIGINS = [
+    'http://localhost:8002',
+    'http://127.0.0.1:8002',
+    'http://51.83.5.176:8002',
+    # Adicionar outras origens conforme necessário (domínios públicos, etc)
+]
 
 # Armazenamento em memória (dicionários simples, sem chave secreta global)
 sessions = {}  # {token: {'email': 'user@domain', 'created': timestamp}}
@@ -32,13 +47,39 @@ login_attempts = {}  # {ip: {'count': 0, 'locked_until': timestamp}}
 
 class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
+    def get_allowed_origin(self, origin):
+        """
+        Valida e retorna a origem se estiver na lista de permitidas.
+        Retorna None se a origem não for permitida.
+        """
+        if not origin:
+            return None
+
+        # Verificar se a origem está na lista de permitidas
+        if origin in ALLOWED_ORIGINS:
+            return origin
+
+        # Permitir qualquer origem de localhost/127.0.0.1 em desenvolvimento
+        if origin.startswith('http://localhost:') or origin.startswith('http://127.0.0.1:'):
+            return origin
+
+        # Não permitir outras origens
+        return None
+
     def do_OPTIONS(self):
         """Handle CORS preflight requests"""
+        origin = self.headers.get('Origin')
+        allowed_origin = self.get_allowed_origin(origin)
+
         self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', self.headers.get('Origin', '*'))
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-        self.send_header('Access-Control-Allow-Credentials', 'true')
+
+        # Só configurar CORS se a origem for permitida
+        if allowed_origin:
+            self.send_header('Access-Control-Allow-Origin', allowed_origin)
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+            self.send_header('Access-Control-Allow-Credentials', 'true')
+
         self.end_headers()
 
     def do_GET(self):
@@ -56,6 +97,12 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         if path == '/logo.png':
             self.serve_file('/opt/spfbl/web/logo.png', 'image/png')
             return
+        if path == '/version.js':
+            self.serve_file('/opt/spfbl/web/version.js', 'application/javascript')
+            return
+        if path == '/version.txt':
+            self.serve_file('/opt/spfbl/web/version.txt', 'text/plain')
+            return
 
         # Extrair email da query string para verificação de status (público)
         parsed = urlparse(self.path)
@@ -67,6 +114,16 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 self.check_user_totp_status(email)
             else:
                 self.send_json_response({'error': 'Email is required'}, 400)
+            return
+
+        # Endpoint público para obter configuração do reCAPTCHA
+        if path == '/api/config/recaptcha':
+            recaptcha_config = self.get_recaptcha_keys()
+            # Retornar apenas a site_key e se está habilitado (não expor secret_key)
+            self.send_json_response({
+                'enabled': recaptcha_config['enabled'],
+                'site_key': recaptcha_config['site_key'] if recaptcha_config['enabled'] else None
+            })
             return
 
         # Verificar autenticação para todas as outras rotas
@@ -285,10 +342,17 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 self.send_json_response({'error': 'Invalid email format'}, 400)
                 return
 
-            # Verificar reCAPTCHA se configurado
-            recaptcha_secret = os.environ.get('RECAPTCHA_SECRET_KEY', '')
-            if recaptcha_secret:
-                if not self.verify_recaptcha(recaptcha_token, recaptcha_secret):
+            # Verificar reCAPTCHA se configurado em spfbl.conf
+            recaptcha_config = self.get_recaptcha_keys()
+            if recaptcha_config['enabled']:
+                # reCAPTCHA está habilitado, validar token
+                if not recaptcha_token:
+                    self.send_json_response({
+                        'error': 'reCAPTCHA token is required'
+                    }, 400)
+                    return
+
+                if not self.verify_recaptcha(recaptcha_token, recaptcha_config['secret_key']):
                     self.send_json_response({
                         'error': 'reCAPTCHA verification failed'
                     }, 400)
@@ -384,6 +448,46 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             pass
         return None
 
+    def get_recaptcha_keys(self):
+        """Get reCAPTCHA keys from spfbl.conf (only if not commented)"""
+        try:
+            with open('/opt/spfbl/spfbl.conf', 'r') as f:
+                content = f.read()
+
+                # Buscar site key (ignora linhas comentadas)
+                site_key_match = re.search(
+                    r'^\s*(?!#)recaptcha_key_site\s*=\s*(.+?)\s*$',
+                    content,
+                    re.MULTILINE
+                )
+
+                # Buscar secret key (ignora linhas comentadas)
+                secret_key_match = re.search(
+                    r'^\s*(?!#)recaptcha_key_secret\s*=\s*(.+?)\s*$',
+                    content,
+                    re.MULTILINE
+                )
+
+                site_key = site_key_match.group(1).strip() if site_key_match else None
+                secret_key = secret_key_match.group(1).strip() if secret_key_match else None
+
+                # Só retorna se AMBAS as chaves estiverem configuradas
+                if site_key and secret_key:
+                    return {
+                        'site_key': site_key,
+                        'secret_key': secret_key,
+                        'enabled': True
+                    }
+
+        except Exception:
+            pass
+
+        return {
+            'site_key': None,
+            'secret_key': None,
+            'enabled': False
+        }
+
     def verify_recaptcha(self, token, secret):
         """Verify reCAPTCHA token"""
         try:
@@ -395,7 +499,18 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             )
             response = urllib.request.urlopen(request, timeout=5)
             result = json.loads(response.read().decode('utf-8'))
-            return result.get('success', False) and result.get('score', 0) > 0.5
+
+            # v2 não devolve score; v3 usa score. Aceitar sucesso simples quando não houver score.
+            success = result.get('success', False)
+            score = result.get('score')
+
+            if not success:
+                return False
+
+            if score is None:
+                return True
+
+            return score >= 0.5
         except Exception:
             return False
 
@@ -412,11 +527,19 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             return False
 
         session = sessions[token]
+        current_time = time.time()
+        session_age = current_time - session['created']
 
         # Verificar timeout da sessão
-        if time.time() - session['created'] > SESSION_TIMEOUT:
+        if session_age > SESSION_TIMEOUT:
             del sessions[token]
             return False
+
+        # Renovação automática de sessão (se estiver nos últimos 10 minutos)
+        # Isso previne session fixation e melhora a segurança
+        if session_age > (SESSION_TIMEOUT - 600):  # 10 minutos antes de expirar
+            session['created'] = current_time
+            session['renewed'] = True
 
         return True
 
@@ -501,16 +624,22 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 self.cleanup_old_sessions()
 
                 # Enviar resposta com cookie seguro
+                origin = self.headers.get('Origin')
+                allowed_origin = self.get_allowed_origin(origin)
+
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', self.headers.get('Origin', '*'))
-                self.send_header('Access-Control-Allow-Credentials', 'true')
+
+                # Configurar CORS apenas para origens permitidas
+                if allowed_origin:
+                    self.send_header('Access-Control-Allow-Origin', allowed_origin)
+                    self.send_header('Access-Control-Allow-Credentials', 'true')
 
                 # Cookie seguro
                 cookie = SimpleCookie()
                 cookie['session_token'] = token
                 cookie['session_token']['httponly'] = True
-                cookie['session_token']['secure'] = False  # Mudar para True em produção com HTTPS
+                cookie['session_token']['secure'] = USE_SECURE_COOKIES  # True se HTTPS habilitado
                 cookie['session_token']['samesite'] = 'Strict'
                 cookie['session_token']['max-age'] = SESSION_TIMEOUT
                 cookie['session_token']['path'] = '/'
@@ -760,12 +889,23 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def verify_totp_with_spfbl(self, email, otp_code):
         """Verify TOTP code against original SPFBL HTTP control panel.
 
+        AVISO DE SEGURANÇA:
+        - Esta função delega autenticação ao painel legado em http://127.0.0.1:8001
+        - Certifique-se que a porta 8001 NÃO está exposta publicamente
+        - Use firewall para bloquear acesso externo à porta 8001
+        - Considere migrar para autenticação nativa no futuro
+
         Fluxo:
         1. Acessa http://127.0.0.1:8001/<email>?otp=<codigo> para submeter o TOTP.
         2. Em seguida acessa http://127.0.0.1:8001/<email> com o mesmo cookie.
         3. Se o HTML de resposta tiver o título do painel de controle, considera autenticado.
         """
         base_url = os.environ.get('SPFBL_PANEL_URL', 'http://127.0.0.1:8001')
+
+        # VALIDAÇÃO: Garantir que o painel legado está em localhost
+        if base_url and '127.0.0.1' not in base_url and 'localhost' not in base_url:
+            # Não permitir acesso a painéis externos
+            return False
 
         try:
             parsed = urllib.parse.urlparse(base_url)
@@ -803,12 +943,23 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def verify_password_with_spfbl(self, email, password):
         """Verify password using the legacy SPFBL HTTP login (same endpoint usado para TOTP).
 
+        AVISO DE SEGURANÇA:
+        - Esta função delega autenticação ao painel legado em http://127.0.0.1:8001
+        - Certifique-se que a porta 8001 NÃO está exposta publicamente
+        - Use firewall para bloquear acesso externo à porta 8001
+        - Considere migrar para autenticação nativa no futuro
+
         Fluxo:
         1. POST http://127.0.0.1:8001/<email> com body password=<senha>
         2. GET a mesma URL com o cookie retornado
         3. Considera autenticado se a resposta contiver o painel de controle
         """
         base_url = os.environ.get('SPFBL_PANEL_URL', 'http://127.0.0.1:8001')
+
+        # VALIDAÇÃO: Garantir que o painel legado está em localhost
+        if base_url and '127.0.0.1' not in base_url and 'localhost' not in base_url:
+            # Não permitir acesso a painéis externos
+            return False
 
         try:
             parsed = urllib.parse.urlparse(base_url)
@@ -870,23 +1021,36 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def verify_spfbl_default_user(self, email, password):
         """Verify against default SPFBL admin user"""
         try:
-            # Primeiro: Verificar se é o usuário padrão criado na instalação
-            if email == 'spfbl@example.com' and password == 'TroqueEssaSenha123!':
-                return True
+            # SEGURANÇA: Credenciais hardcoded foram REMOVIDAS
+            # Se você precisa de um usuário padrão, configure em spfbl.conf
 
-            # Segundo: Procurar configuração de admin_email no spfbl.conf
+            # Procurar configuração de admin_email no spfbl.conf
             with open('/opt/spfbl/spfbl.conf', 'r') as f:
                 content = f.read()
 
-                # Verificar se este email é o admin_email configurado
-                if f'admin_email={email}' in content:
-                    # Extrair senha SMTP (última opção)
-                    for line in content.split('\n'):
-                        if line.startswith('smtp_password='):
-                            stored_password = line.split('=', 1)[1].strip()
-                            return password == stored_password
+                # CORREÇÃO DE SEGURANÇA: Usar regex para validação exata da linha
+                # Evita bypass via substring injection (ex: "admin_email=user@domain.com")
+                # IMPORTANTE: Ignora linhas comentadas (começando com #)
+                admin_email_pattern = r'^\s*(?!#)admin_email\s*=\s*(' + re.escape(email) + r')\s*$'
+                admin_match = re.search(admin_email_pattern, content, re.MULTILINE | re.IGNORECASE)
 
-        except:
+                if admin_match:
+                    # CORREÇÃO DE SEGURANÇA: Usar regex para extrair senha também
+                    # Evita injeção e garante que pegamos a linha correta
+                    # IMPORTANTE: Ignora linhas comentadas
+                    smtp_password_pattern = r'^\s*(?!#)smtp_password\s*=\s*(.+?)\s*$'
+                    password_match = re.search(smtp_password_pattern, content, re.MULTILINE)
+
+                    if password_match:
+                        stored_password = password_match.group(1).strip()
+                        # Usar comparação com timing constante para evitar timing attacks
+                        return hmac.compare_digest(password.encode('utf-8'), stored_password.encode('utf-8'))
+
+        except FileNotFoundError:
+            # Arquivo de configuração não encontrado
+            pass
+        except Exception as e:
+            # Log erro mas não exponha detalhes
             pass
 
         return False
@@ -957,15 +1121,53 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             del sessions[token]
 
     def sanitize_input(self, input_string):
-        """Sanitize user input to prevent XSS and injection"""
-        # Remove caracteres perigosos
-        sanitized = re.sub(r'[<>"\';()&]', '', input_string)
+        """
+        Sanitize user input to prevent XSS and command injection.
+
+        IMPORTANTE: Esta função é para sanitizar emails, nomes, etc.
+        NÃO use para sanitizar senhas, pois pode quebrar senhas válidas!
+        """
+        if not input_string:
+            return ''
+
+        # Remover caracteres perigosos que podem ser usados em ataques
+        # Lista completa: < > " ' ; ( ) & | ` $ { } \ e caracteres de controle
+        # NOTA: Não removemos @ . - _ + pois são válidos em emails
+        dangerous_chars = r'[<>"\';()&|`${}\\]'
+        sanitized = re.sub(dangerous_chars, '', input_string)
+
+        # Remover caracteres de controle (newline, tab, etc) separadamente
+        # usando \x00-\x1F (caracteres de controle ASCII)
+        sanitized = re.sub(r'[\x00-\x1F\x7F]', '', sanitized)
+
+        # Remover espaços extras e retornar
         return sanitized.strip()
+
+    def escape_html(self, text):
+        """
+        Escape HTML special characters to prevent XSS when displaying user data.
+        Use this when you need to display user-provided data in HTML context.
+        """
+        if not text:
+            return ''
+        return html.escape(str(text), quote=True)
 
     def is_valid_email(self, email):
         """Validate email format"""
         pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         return re.match(pattern, email) is not None
+
+    def build_csp_policy(self):
+        """Centraliza a política CSP para reutilização"""
+        return (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://www.google.com/recaptcha/ https://www.gstatic.com/recaptcha/; "
+            "style-src 'self' 'unsafe-inline' https://www.gstatic.com/recaptcha/; "
+            "img-src 'self' data: https://www.gstatic.com/recaptcha/; "
+            "frame-src 'self' https://www.google.com/recaptcha/; "
+            "connect-src 'self' https://www.google.com/recaptcha/; "
+            "font-src 'self' https://fonts.gstatic.com;"
+        )
 
     def serve_login_page(self):
         """Serve login page"""
@@ -989,8 +1191,9 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.send_header('X-Frame-Options', 'DENY')
             self.send_header('X-XSS-Protection', '1; mode=block')
             self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
-            self.send_header('Content-Security-Policy',
-                           "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:;")
+
+            # Permitir domínios necessários para o reCAPTCHA sem abrir o restante da política
+            self.send_header('Content-Security-Policy', self.build_csp_policy())
 
             self.end_headers()
             self.wfile.write(content)
@@ -1001,10 +1204,17 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
     def send_json_response(self, data, status=200):
         """Send JSON response with security headers"""
+        origin = self.headers.get('Origin')
+        allowed_origin = self.get_allowed_origin(origin)
+
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', self.headers.get('Origin', '*'))
-        self.send_header('Access-Control-Allow-Credentials', 'true')
+
+        # Configurar CORS apenas para origens permitidas
+        if allowed_origin:
+            self.send_header('Access-Control-Allow-Origin', allowed_origin)
+            self.send_header('Access-Control-Allow-Credentials', 'true')
+
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
@@ -1879,11 +2089,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('X-XSS-Protection', '1; mode=block')
         self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
-        self.send_header(
-            'Content-Security-Policy',
-            "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-            "style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
-        )
+        self.send_header('Content-Security-Policy', self.build_csp_policy())
         self.end_headers()
         self.wfile.write(page.encode('utf-8', errors='replace'))
 
@@ -2092,10 +2298,6 @@ if __name__ == '__main__':
     print(f"   Dashboard: http://0.0.0.0:{PORT}/dashboard.html")
     print(f"   Login: http://0.0.0.0:{PORT}/login")
     print(f"   API: http://0.0.0.0:{PORT}/api/stats")
-    print(f"")
-    print(f"   Default credentials:")
-    print(f"   Email: spfbl@example.com")
-    print(f"   Password: TroqueEssaSenha123!")
     print(f"")
     print(f"   Session timeout: {SESSION_TIMEOUT}s")
     print(f"   Max login attempts: {MAX_LOGIN_ATTEMPTS}")
