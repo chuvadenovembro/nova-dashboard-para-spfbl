@@ -119,44 +119,6 @@ cd /usr/local/directadmin/custombuild
 ./build exim_conf
 systemctl restart exim
 ```
-
----
-
-## 📝 Changelog
-
-### v0.01 - Versão Alpha
-
-**Novo**
-- ✨ Dashboard moderna com tema claro/escuro
-- ✨ Instalador automatizado para Ubuntu 22.04
-- ✨ Interface completa para gerenciamento de clientes SPFBL
-- ✨ Sistema de consultas com filtros avançados
-- ✨ Gerenciamento de listas de controle (blacklist/whitelist)
-- ✨ Painel de logs com rastreamento de atividades
-- ✨ Editor de configuração com backup automático
-- ✨ Autenticação com TOTP (Time-based One-Time Password)
-- ✨ Suporte integrado para DirectAdmin
-
-**Melhorias**
-- 🚀 Otimização automática de memória JVM
-- 🚀 Configuração simplificada do Exim
-- 🚀 Interface responsiva em dispositivos móveis
-
-**Correções**
-- 🐛 Tratamento robusto de erros de instalação
-- 🐛 Validação de portas e permissões de firewall
-
----
-
-## 🎯 Objetivo do Projeto
-
-Fornecer uma solução **pronta para produção** de SPFBL para servidores Ubuntu 22.04, com ênfase especial em integração com **DirectAdmin**. A nova dashboard moderniza significativamente a experiência de administração comparada ao painel clássico, oferecendo:
-
-- 🔐 Administração segura com autenticação TOTP
-- 📊 Observabilidade completa do sistema
-- ⚙️ Configuração centralizada e intuitiva
-- 🚀 Performance otimizada em qualquer hardware
-
 ---
 
 ## 📄 Licença
