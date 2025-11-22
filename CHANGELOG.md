@@ -1,5 +1,22 @@
 # Changelog
 
+## [v0.04] - Em edição
+
+### Novo
+- Aviso de atualização da dashboard
+- Proteção da configuração e logs com a criação do arquivo /opt/spfbl/spfbl.conf.lock
+
+### Melhorias
+- Melhorias no design
+- Melhorias no layout responsivo
+
+### Correções
+- Falha na exibição das consultas
+- Falha no script para adicionar servidor directadmin remotamente
+- Falha na exibição do recaptcha na tela de login (quando habilitado)
+
+---
+
 ## [v0.03] - Sistema de Eventos de Fraude e Melhorias de Segurança
 
 ### Novo
