@@ -11,9 +11,7 @@
 - Melhorias no layout responsivo
 
 ### Correções
-- Falha na exibição das consultas
-- Falha no script para adicionar servidor directadmin remotamente
-- Falha na exibição do recaptcha na tela de login (quando habilitado)
+- Modo responsivo
 
 ---
 
