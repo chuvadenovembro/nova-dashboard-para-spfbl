@@ -1384,8 +1384,6 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def get_stats(self):
         """Get SPFBL statistics"""
         try:
-            client_networks = self.get_authorized_networks()
-
             log_file = f"/var/log/spfbl/spfbl.{datetime.now().strftime('%Y-%m-%d')}.log"
             total_queries = 0
             blocked = 0
@@ -1397,13 +1395,6 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 with open(log_file, 'r') as f:
                     for line in f:
                         if 'SPF' in line and '=>' in line:
-                            ip_match = re.search(r"SPF '([^']+)'", line)
-                            if not ip_match:
-                                continue
-
-                            if not self.is_authorized_client_ip(ip_match.group(1), client_networks):
-                                continue
-
                             total_queries += 1
                             if '=> BLOCKED' in line or '=> BANNED' in line:
                                 blocked += 1
@@ -1416,7 +1407,6 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
             stats = {
                 'total_queries': total_queries,
-                'clients_connected': len(client_networks),
                 'blocked': blocked,
                 'passed': passed,
                 'softfail': softfail,
@@ -1451,12 +1441,26 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
 
+    def _validate_query(self, query):
+        """Validate and sanitize query data"""
+        return {
+            'timestamp': (query.get('timestamp') or '').strip(),
+            'ip': (query.get('ip') or '').strip(),
+            'sender': (query.get('sender') or '').strip(),
+            'helo': (query.get('helo') or '').strip(),
+            'recipient': (query.get('recipient') or '').strip(),
+            'result': (query.get('result') or 'UNKNOWN').strip().upper(),
+            'fraud': query.get('fraud', False),
+            'reason': (query.get('reason') or '').strip(),
+            'reporter': (query.get('reporter') or '').strip()
+        }
+
     def get_recent_queries(self):
-        """Get recent queries from log"""
+        """Get recent queries from log, prioritizing fraud events"""
         try:
             log_file = f"/var/log/spfbl/spfbl.{datetime.now().strftime('%Y-%m-%d')}.log"
             queries = []
-            client_networks = self.get_authorized_networks()
+            max_spf_queries = 50  # Reserve space for fraud events
 
             if os.path.exists(log_file):
                 with open(log_file, 'r') as f:
@@ -1464,40 +1468,53 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
                 count = 0
                 for line in reversed(lines):
-                    if 'SPF' in line and '=>' in line and count < 100:
-                        # Corrigido: [+-] ao invés de \+ para aceitar timezones negativos (ex: -0300)
-                        match = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[+-]\d+).*SPF.*\'(.+?)\'.*\'(.+?)\'.*\'(.+?)\'.*\'(.+?)\'.*=> (\w+)', line)
+                    if 'SPF' in line and '=>' in line and count < max_spf_queries:
+                        # Improved regex: captures result only up to first space or special char
+                        match = re.search(
+                            r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[+-]\d{4}).*SPF\s+\'([^\']*?)\'.*\'([^\']*?)\'.*\'([^\']*?)\'.*\'([^\']*?)\'.*=>\s+([A-Z\-]+)',
+                            line
+                        )
                         if match:
                             timestamp, ip, sender, helo, recipient, result = match.groups()
-                            if not self.is_authorized_client_ip(ip, client_networks):
-                                continue
-                            queries.append({
-                                'timestamp': timestamp,
-                                'ip': ip,
-                                'sender': sender,
-                                'helo': helo,
-                                'recipient': recipient,
-                                'result': result
-                            })
+                            query_data = {
+                                'timestamp': timestamp.strip(),
+                                'ip': ip.strip(),
+                                'sender': sender.strip(),
+                                'helo': helo.strip(),
+                                'recipient': recipient.strip(),
+                                'result': result.strip()
+                            }
+                            validated = self._validate_query(query_data)
+                            queries.append(validated)
                             count += 1
 
+            # Load fraud events (up to 50)
             fraud_entries = []
             fraud_events = self.load_fraud_events()
-            for event in reversed(fraud_events[-100:]):
-                fraud_entries.append({
+            for event in reversed(fraud_events[-50:]):
+                fraud_data = {
                     'timestamp': event.get('timestamp', ''),
-                    'ip': event.get('ip'),
-                    'sender': event.get('sender'),
-                    'helo': event.get('helo'),
-                    'recipient': event.get('recipient'),
+                    'ip': event.get('ip', ''),
+                    'sender': event.get('sender', ''),
+                    'helo': event.get('helo', ''),
+                    'recipient': event.get('recipient', ''),
                     'result': event.get('result', 'FRAUD'),
                     'fraud': True,
                     'reason': event.get('reason'),
                     'reporter': event.get('reporter')
-                })
+                }
+                validated = self._validate_query(fraud_data)
+                fraud_entries.append(validated)
 
+            # Combine and sort correctly (50 SPF + 50 fraud = 100 total)
             combined = queries + fraud_entries
-            combined.sort(key=lambda q: q.get('timestamp', ''), reverse=True)
+
+            # Sort by timestamp in reverse order (newest first)
+            def get_sort_key(item):
+                ts = item.get('timestamp', '')
+                return ts if ts else ''
+
+            combined.sort(key=get_sort_key, reverse=True)
             combined = combined[:100]
 
             self.send_json_response({'queries': combined})
@@ -1509,7 +1526,6 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         try:
             log_file = f"/var/log/spfbl/spfbl.{datetime.now().strftime('%Y-%m-%d')}.log"
             hourly_stats = {}
-            client_networks = self.get_authorized_networks()
 
             for hour in range(24):
                 hourly_stats[hour] = {
@@ -1524,13 +1540,6 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 with open(log_file, 'r') as f:
                     for line in f:
                         if 'SPF' in line and '=>' in line:
-                            ip_match = re.search(r"SPF '([^']+)'", line)
-                            if not ip_match:
-                                continue
-
-                            if not self.is_authorized_client_ip(ip_match.group(1), client_networks):
-                                continue
-
                             match = re.search(r'T(\d{2}):', line)
                             if match:
                                 hour = int(match.group(1))

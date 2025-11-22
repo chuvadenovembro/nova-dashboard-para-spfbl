@@ -2382,3 +2382,45 @@ body.theme-dark .address-pill.subtle {
         max-height: 260px;
     }
 }
+
+/* ===========================
+   Estilos para Eventos de Fraude
+   =========================== */
+
+.query-row.fraud-row {
+    background-color: rgba(254, 226, 226, 0.3);
+    border-left: 3px solid #dc2626;
+}
+
+.query-row.fraud-row:hover {
+    background-color: rgba(254, 226, 226, 0.5);
+}
+
+.query-row.fraud-row.selected {
+    background-color: rgba(254, 226, 226, 0.7);
+    border-left-color: #991b1b;
+}
+
+.fraud-indicator {
+    display: inline-block;
+    background-color: #dc2626;
+    color: white;
+    padding: 0.25rem 0.5rem;
+    border-radius: 3px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    margin-right: 0.5rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.fraud-details {
+    margin-top: 0.75rem;
+    padding: 0.75rem;
+    background: #fee2e2;
+    border: 1px solid #fecaca;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    color: #991b1b;
+    line-height: 1.5;
+}

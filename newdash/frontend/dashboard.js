@@ -63,12 +63,15 @@ function generateRowId(index) {
 function normalizeQuery(rawQuery, index) {
     const normalized = {
         ...rawQuery,
-        timestamp: safeString(rawQuery?.timestamp),
+        timestamp: rawQuery?.timestamp ? safeString(rawQuery.timestamp).trim() : null,
         ip: safeString(rawQuery?.ip),
         sender: safeString(rawQuery?.sender),
         recipient: safeString(rawQuery?.recipient),
         helo: safeString(rawQuery?.helo),
         result: safeString(rawQuery?.result || 'N/A').toUpperCase(),
+        fraud: rawQuery?.fraud === true,
+        reason: safeString(rawQuery?.reason || ''),
+        reporter: safeString(rawQuery?.reporter || ''),
         _rowId: rawQuery?._rowId || generateRowId(index)
     };
     return normalized;
@@ -78,15 +81,35 @@ function normalizeQueries(rawQueries) {
     return (rawQueries || []).map((query, index) => normalizeQuery(query, index));
 }
 
+// Parse timestamp safely with timezone support
+function parseTimestampSafely(timestamp) {
+    if (!timestamp) return null;
+
+    try {
+        // Converte +0000 para +00:00 se necessário (suporte para timezone)
+        const normalized = String(timestamp).replace(/([+-]\d{2})(\d{2})$/, '$1:$2');
+        const date = new Date(normalized);
+
+        if (isNaN(date.getTime())) {
+            return null;
+        }
+        return date;
+    } catch (error) {
+        return null;
+    }
+}
+
 function formatRelativeTime(timestamp) {
     if (!timestamp) {
         return '';
     }
     try {
-        const date = new Date(timestamp);
-        if (Number.isNaN(date.getTime())) {
+        const date = parseTimestampSafely(timestamp);
+
+        if (!date || isNaN(date.getTime())) {
             return '';
         }
+
         const diffMs = Date.now() - date.getTime();
         if (diffMs < 0) {
             return '';
@@ -546,6 +569,7 @@ function displayQueries(queriesToDisplay) {
     tbody.innerHTML = queriesToDisplay.map(q => {
         const rowId = q._rowId;
         const isSelected = rowId === selectedQueryId;
+        const isFraud = q.fraud === true;
         const time = q.timestamp ? escapeHtml(formatTimestamp(q.timestamp)) : placeholder;
         const relativeTime = q.timestamp ? formatRelativeTime(q.timestamp) : '';
         const relativeHtml = relativeTime ? `<span class="query-meta-sub">${escapeHtml(relativeTime)}</span>` : '';
@@ -556,12 +580,14 @@ function displayQueries(queriesToDisplay) {
         const recipient = q.recipient ? escapeHtml(q.recipient) : '';
         const result = q.result || 'N/A';
         const resultSlug = result.replace(/[^a-z0-9_-]/gi, '') || 'UNKNOWN';
+        const fraudBadge = isFraud ? `<span class="fraud-indicator" title="Evento de Fraude: ${escapeHtml(q.reason || '')}">[FRAUDE]</span>` : '';
         const resultBadge = `<span class="result-badge result-chip result-${resultSlug}">${escapeHtml(result)}</span>`;
 
         return `
             <tr
-                class="query-row ${isSelected ? 'selected' : ''}"
+                class="query-row ${isSelected ? 'selected' : ''} ${isFraud ? 'fraud-row' : ''}"
                 data-row-id="${rowId}"
+                data-is-fraud="${isFraud}"
                 tabindex="0"
                 role="button"
                 aria-pressed="${isSelected ? 'true' : 'false'}"
@@ -578,7 +604,7 @@ function displayQueries(queriesToDisplay) {
                     </div>
                 </td>
                 <td class="cell-result" data-label="Resultado">
-                    ${resultBadge}
+                    ${fraudBadge} ${resultBadge}
                 </td>
                 <td class="cell-ip" data-label="IP Origem">
                     ${ip ? `<code class="mono mono-truncate" title="${ip}">${ipDisplay}</code>` : placeholder}
@@ -668,12 +694,26 @@ function updateSelectedQueryPanel() {
     const resultSlug = selected.result.replace(/[^a-z0-9_-]/gi, '') || 'UNKNOWN';
     const resultBadge = `<span class="result-badge result-chip result-${resultSlug} selected-query-result">${escapeHtml(selected.result)}</span>`;
     const formattedTime = selected.timestamp ? escapeHtml(formatTimestamp(selected.timestamp)) : '--:--';
+
+    // Mostrar detalhes de fraude se aplicável
+    let fraudInfo = '';
+    if (selected.fraud === true) {
+        fraudInfo = `
+            <div class="fraud-details">
+                <strong style="color: #dc2626;">🚨 Evento de Fraude</strong>
+                ${selected.reason ? `<br><small>Motivo: ${escapeHtml(selected.reason)}</small>` : ''}
+                ${selected.reporter ? `<br><small>Reportado por: ${escapeHtml(selected.reporter)}</small>` : ''}
+            </div>
+        `;
+    }
+
     const summary = `
         ${resultBadge}
         <strong>${escapeHtml(selected.ip || '--')}</strong>
         <span class="selected-query-arrow">&rarr;</span>
         <strong>${escapeHtml(selected.recipient || '--')}</strong>
         <span class="selected-query-meta">${formattedTime}</span>
+        ${fraudInfo}
     `;
     info.innerHTML = summary;
 
@@ -1006,7 +1046,12 @@ function refreshData() {
 
 // Utility Functions
 function formatTimestamp(timestamp) {
-    const date = new Date(timestamp);
+    const date = parseTimestampSafely(timestamp);
+
+    if (!date) {
+        return '--:--:--';
+    }
+
     return date.toLocaleString('pt-BR', {
         hour: '2-digit',
         minute: '2-digit',
