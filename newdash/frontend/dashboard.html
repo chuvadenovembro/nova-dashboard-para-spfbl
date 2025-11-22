@@ -158,29 +158,85 @@
                         <option value="FAIL">FAIL</option>
                     </select>
                 </div>
-                <div class="table-actions">
-                    <button class="btn btn-success" onclick="handleUnblockToken()" title="Desbloquear IP/Domínio/Email">
-                        🔓 Desbloquear
-                    </button>
-                    <button class="btn btn-danger" onclick="handleRemoveFromWhitelist()" title="Remover da Whitelist">
-                        ❌ Remover da Whitelist
-                    </button>
+                <div class="queries-toolbar">
+                    <div class="selected-query-panel" id="selected-query-panel">
+                        <div class="selected-query-info" id="selected-query-info">
+                            <span class="placeholder">Nenhuma consulta selecionada</span>
+                        </div>
+                        <div class="selected-query-buttons">
+                            <div class="selected-button-group">
+                                <button
+                                    id="action-clear-selection"
+                                    class="btn btn-ghost btn-compact"
+                                    type="button"
+                                    onclick="clearSelectedQuery()"
+                                    disabled
+                                >
+                                    Limpar seleção
+                                </button>
+                                <button
+                                    id="action-block-ip"
+                                    class="btn btn-danger btn-compact"
+                                    type="button"
+                                    onclick="handleSelectedAction('block-ip')"
+                                    disabled
+                                >
+                                    Bloquear IP
+                                </button>
+                                <button
+                                    id="action-whitelist-ip"
+                                    class="btn btn-success btn-compact"
+                                    type="button"
+                                    onclick="handleSelectedAction('whitelist-ip')"
+                                    disabled
+                                >
+                                    Whitelist
+                                </button>
+                                <button
+                                    id="action-block-sender"
+                                    class="btn btn-outline btn-compact"
+                                    type="button"
+                                    onclick="handleSelectedAction('block-sender')"
+                                    disabled
+                                >
+                                    Bloquear remetente
+                                </button>
+                            </div>
+                            <div class="selected-button-group global">
+                                <button
+                                    class="btn btn-success btn-compact"
+                                    type="button"
+                                    onclick="handleUnblockToken()"
+                                    title="Desbloquear IP/Domínio/Email"
+                                >
+                                    🔓 Desbloquear
+                                </button>
+                                <button
+                                    class="btn btn-danger btn-compact"
+                                    type="button"
+                                    onclick="handleRemoveFromWhitelist()"
+                                    title="Remover da Whitelist"
+                                >
+                                    ❌ Remover da Whitelist
+                                </button>
+                            </div>
+                        </div>
+                    </div>
                 </div>
                 <div class="table-container">
                     <table class="data-table" id="queries-table">
                         <thead>
                             <tr>
                                 <th>Horário</th>
+                                <th>Resultado</th>
                                 <th>IP Origem</th>
                                 <th>Remetente</th>
-                                <th>HELO</th>
                                 <th>Destinatário</th>
-                                <th>Resultado</th>
-                                <th>Ações</th>
+                                <th>HELO</th>
                             </tr>
                         </thead>
                         <tbody id="queries-tbody">
-                            <tr><td colspan="7" class="loading">Carregando consultas...</td></tr>
+                            <tr><td colspan="6" class="loading">Carregando consultas...</td></tr>
                         </tbody>
                     </table>
                 </div>

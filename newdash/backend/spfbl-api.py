@@ -17,10 +17,15 @@ import urllib.request
 import http.cookiejar
 import shutil
 import html
+import ipaddress
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from http.cookies import SimpleCookie
+
+FRAUD_EVENTS_FILE = '/opt/spfbl/data/fraud-events.json'
+FRAUD_TOKEN_FILE = '/opt/spfbl/data/fraud_token'
+MAX_FRAUD_EVENTS = 500
 
 # Configurações de Sessão (somente em memória)
 # NOTA: Para produção, considere usar Redis ou banco de dados para persistência
@@ -153,6 +158,8 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query)
             log_type = (params.get('type') or ['all'])[0]
             self.get_logs(log_type)
+        elif path == '/api/fraud-events':
+            self.get_fraud_events()
         elif path == '/api/server/memory':
             self.get_server_memory()
         elif path == '/api/settings/config':
@@ -180,6 +187,8 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.handle_login()
         elif path == '/api/user/request-totp':
             self.handle_request_totp()
+        elif path == '/api/fraud-events':
+            self.handle_fraud_event_report()
         elif path == '/api/logout':
             self.handle_logout()
         elif path == '/api/clients/add':
@@ -1219,6 +1228,59 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
+    def get_authorized_networks(self):
+        """Return list of authorized client networks excluding loopback"""
+        networks = []
+        output = self.run_spfbl_command('client show') or ''
+
+        if output.startswith('ERROR'):
+            return networks
+
+        for raw_line in output.strip().split('\n'):
+            line = raw_line.strip()
+            if not line or ':' not in line:
+                continue
+
+            try:
+                ident_cidr = line.split()[0]
+            except IndexError:
+                continue
+
+            if ':' not in ident_cidr:
+                continue
+
+            _, cidr = ident_cidr.rsplit(':', 1)
+
+            try:
+                network = ipaddress.ip_network(cidr, strict=False)
+            except ValueError:
+                continue
+
+            if network.is_loopback:
+                continue
+
+            networks.append(network)
+
+        return networks
+
+    def is_authorized_client_ip(self, ip_str, networks=None):
+        """Check if provided IP belongs to an authorized client network"""
+        if not ip_str:
+            return False
+
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+
+        if networks is None:
+            networks = self.get_authorized_networks()
+
+        for network in networks:
+            if ip_obj in network:
+                return True
+        return False
+
     def run_spfbl_command(self, command):
         """Execute SPFBL CLI command and return output"""
         try:
@@ -1232,11 +1294,97 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             return f"ERROR: {str(e)}"
 
+    def get_fraud_token(self):
+        """Return shared token for fraud event reporting"""
+        try:
+            with open(FRAUD_TOKEN_FILE, 'r') as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            return None
+
+    def load_fraud_events(self):
+        """Load stored fraud events"""
+        try:
+            with open(FRAUD_EVENTS_FILE, 'r') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except FileNotFoundError:
+            return []
+        except json.JSONDecodeError:
+            return []
+        return []
+
+    def write_fraud_events(self, events):
+        """Persist fraud events safely"""
+        os.makedirs(os.path.dirname(FRAUD_EVENTS_FILE), exist_ok=True)
+        tmp_file = f"{FRAUD_EVENTS_FILE}.tmp"
+        with open(tmp_file, 'w') as f:
+            json.dump(events, f)
+        os.replace(tmp_file, FRAUD_EVENTS_FILE)
+
+    def append_fraud_event(self, event):
+        """Append event to store respecting max size"""
+        events = self.load_fraud_events()
+        events.append(event)
+        events = events[-MAX_FRAUD_EVENTS:]
+        self.write_fraud_events(events)
+
+    def get_fraud_events(self):
+        """Return fraud events for authenticated dashboard users"""
+        if not self.is_authenticated():
+            self.send_json_response({'error': 'Unauthorized'}, 401)
+            return
+
+        events = self.load_fraud_events()
+        self.send_json_response({'events': events[-100:]})
+
+    def handle_fraud_event_report(self):
+        """Accept fraud blocking reports from remote servers"""
+        expected_token = self.get_fraud_token()
+        auth_header = self.headers.get('Authorization', '')
+        provided_token = ''
+        if auth_header.lower().startswith('bearer '):
+            provided_token = auth_header.split(' ', 1)[1].strip()
+
+        if not expected_token or provided_token != expected_token:
+            self.send_json_response({'error': 'Unauthorized'}, 401)
+            return
+
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            raw_body = self.rfile.read(content_length).decode('utf-8') if content_length else ''
+            content_type = self.headers.get('Content-Type', '')
+
+            if 'application/json' in content_type:
+                body = json.loads(raw_body or '{}')
+            else:
+                body = {k: v[0] for k, v in parse_qs(raw_body).items()}
+        except Exception:
+            self.send_json_response({'error': 'Invalid payload'}, 400)
+            return
+
+        timestamp = datetime.utcnow().isoformat() + 'Z'
+        reason = body.get('reason') or 'FRAUD'
+
+        event = {
+            'timestamp': timestamp,
+            'ip': body.get('ip', ''),
+            'sender': body.get('sender', ''),
+            'helo': body.get('helo', ''),
+            'recipient': body.get('recipient', ''),
+            'result': reason,
+            'reason': reason,
+            'reporter': self.client_address[0]
+        }
+
+        self.append_fraud_event(event)
+        self.send_json_response({'success': True})
+
     def get_stats(self):
         """Get SPFBL statistics"""
         try:
-            clients_output = self.run_spfbl_command('client show')
-            clients = clients_output.strip().split('\n') if clients_output else []
+            client_networks = self.get_authorized_networks()
 
             log_file = f"/var/log/spfbl/spfbl.{datetime.now().strftime('%Y-%m-%d')}.log"
             total_queries = 0
@@ -1249,6 +1397,13 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 with open(log_file, 'r') as f:
                     for line in f:
                         if 'SPF' in line and '=>' in line:
+                            ip_match = re.search(r"SPF '([^']+)'", line)
+                            if not ip_match:
+                                continue
+
+                            if not self.is_authorized_client_ip(ip_match.group(1), client_networks):
+                                continue
+
                             total_queries += 1
                             if '=> BLOCKED' in line or '=> BANNED' in line:
                                 blocked += 1
@@ -1261,7 +1416,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
             stats = {
                 'total_queries': total_queries,
-                'clients_connected': len([c for c in clients if c.strip()]),
+                'clients_connected': len(client_networks),
                 'blocked': blocked,
                 'passed': passed,
                 'softfail': softfail,
@@ -1301,6 +1456,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         try:
             log_file = f"/var/log/spfbl/spfbl.{datetime.now().strftime('%Y-%m-%d')}.log"
             queries = []
+            client_networks = self.get_authorized_networks()
 
             if os.path.exists(log_file):
                 with open(log_file, 'r') as f:
@@ -1313,6 +1469,8 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                         match = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[+-]\d+).*SPF.*\'(.+?)\'.*\'(.+?)\'.*\'(.+?)\'.*\'(.+?)\'.*=> (\w+)', line)
                         if match:
                             timestamp, ip, sender, helo, recipient, result = match.groups()
+                            if not self.is_authorized_client_ip(ip, client_networks):
+                                continue
                             queries.append({
                                 'timestamp': timestamp,
                                 'ip': ip,
@@ -1323,7 +1481,26 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                             })
                             count += 1
 
-            self.send_json_response({'queries': queries})
+            fraud_entries = []
+            fraud_events = self.load_fraud_events()
+            for event in reversed(fraud_events[-100:]):
+                fraud_entries.append({
+                    'timestamp': event.get('timestamp', ''),
+                    'ip': event.get('ip'),
+                    'sender': event.get('sender'),
+                    'helo': event.get('helo'),
+                    'recipient': event.get('recipient'),
+                    'result': event.get('result', 'FRAUD'),
+                    'fraud': True,
+                    'reason': event.get('reason'),
+                    'reporter': event.get('reporter')
+                })
+
+            combined = queries + fraud_entries
+            combined.sort(key=lambda q: q.get('timestamp', ''), reverse=True)
+            combined = combined[:100]
+
+            self.send_json_response({'queries': combined})
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
 
@@ -1332,6 +1509,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         try:
             log_file = f"/var/log/spfbl/spfbl.{datetime.now().strftime('%Y-%m-%d')}.log"
             hourly_stats = {}
+            client_networks = self.get_authorized_networks()
 
             for hour in range(24):
                 hourly_stats[hour] = {
@@ -1346,6 +1524,13 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 with open(log_file, 'r') as f:
                     for line in f:
                         if 'SPF' in line and '=>' in line:
+                            ip_match = re.search(r"SPF '([^']+)'", line)
+                            if not ip_match:
+                                continue
+
+                            if not self.is_authorized_client_ip(ip_match.group(1), client_networks):
+                                continue
+
                             match = re.search(r'T(\d{2}):', line)
                             if match:
                                 hour = int(match.group(1))

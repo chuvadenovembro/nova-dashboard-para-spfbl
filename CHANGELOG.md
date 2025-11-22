@@ -1,5 +1,44 @@
 # Changelog
 
+## [v0.03] - Sistema de Eventos de Fraude e Melhorias de Segurança
+
+### Novo
+- **Token de Autenticação de Fraude**: Sistema automático de geração e distribuição de tokens para autenticação de eventos de fraude entre servidor SPFBL e clientes DirectAdmin (install_spfbl.sh:162-187, 832-855)
+- **Detecção de Fraude SRS**: Lógica aprimorada no cliente SPFBL que reconhece envelopes SRS encadeados e retorna `FRAUD-SRS(...)` antes de consultar o servidor central (spfbl-client-template.sh:36-176, 3791-3810)
+- **Registro de Eventos de Fraude**: API e dashboard incorporam novo fluxo para armazenar, agrupar e destacar visualmente denúncias de fraude (newdash/backend/spfbl-api.py:25-210, 1299-1340; newdash/frontend/dashboard.js:448-505, dashboard.css:1014-1036)
+- **Rejeição de Fraude na ACL do Exim**: DirectAdmin passa a registrar e rejeitar qualquer resultado `FRAUD-*`, evitando avanço de mensagens mesmo com indisponibilidade do servidor SPFBL (install_spfbl_directadmin_51_83_5_176.sh:13-148, 196-204)
+
+### Melhorias
+
+#### Instalador (install_spfbl.sh)
+- Validação obrigatória de `MAIL_DOMAIN` e `SPFBL_ADMIN_EMAIL` antes de prosseguir (install_spfbl.sh:320), evitando instalações incompletas
+- Detecção de IP público agora usa quedas graduais (curl → wget → dig) com fallback para IP privado quando necessário (install_spfbl.sh:356), tornando o processo mais resiliente
+- Função `ensure_python2_default` não renomeia mais `/usr/bin/python`; ajusta symlink apenas quando seguro (install_spfbl.sh:444), prevenindo efeitos colaterais no sistema
+- Fluxo principal reorganizado para instalar dependências antes de detectar IP público e validar entradas logo no início (install_spfbl.sh:2611), garantindo ferramentas presentes para etapas seguintes
+- Instalador do DirectAdmin agora inclui `FRAUD_EVENT_ENDPOINT` e `FRAUD_EVENT_TOKEN`, instala curl automaticamente e insere novos parâmetros no cliente via sed (install_spfbl_directadmin_51_83_5_176.sh:142-147)
+
+#### Dashboard e API (newdash/*)
+- API filtra estatísticas, gráficos horários e consultas para contar apenas clientes autorizados, ignorando acessos locais (newdash/backend/spfbl-api.py:1214-1534)
+- Página de consultas redesenhada com resultados em destaque, cartões responsivos, seleção por linha e painel com ações consolidadas e modernas (newdash/frontend/dashboard.html:150-228, dashboard.css:702-1051, dashboard.js:25-683)
+- Navegação em dispositivos móveis convertida para topbar compacta com apenas ícones; botão de recolher discreto na base da sidebar com adaptação automática ao viewport (dashboard.css:60-210, 725-826, dashboard.js:3-187)
+- Melhorias adicionais de UX: truncamento inteligente de HELO longo (dashboard.css:930), botões globais integrados ao painel de seleção e normalização de consultas para exibição consistente nos filtros
+
+#### Cliente SPFBL (spfbl-client-template.sh)
+- Inclusão de variáveis de endpoint/token para autenticação de eventos (spfbl-client-template.sh:36-176)
+- Adição de utilitários: `escape_regex`, `detect_local_srs_domain`, `report_fraud_event` (spfbl-client-template.sh:3791-3810)
+- Detecção de domínios locais via `/etc/virtual/` e similares com curta-circuito no comando query que retorna `FRAUD-SRS(...)` e dispara POST autenticado para o dashboard
+
+### Correções
+- Falhas na distribuição de configurações de fraude para clientes remotos resolvidas com sistema de token seguro
+- Problemas de timeout em consultas resolvidos com rejeição local de fraude SRS antes de acessar o servidor central
+
+### Notas de Implantação
+- Replicar novo `install_spfbl_directadmin_*.sh` em cada servidor DirectAdmin ou reaplicar cliente usando script gerado para que o binário `/usr/local/bin/spfbl` receba heurísticas e token atualizado
+- Garantir conectividade HTTP do DirectAdmin para `http://51.83.5.176:8002/api/fraud-events` (porta 8002/TCP) para registro de eventos no dashboard
+- Monitorar painel "Consultas" após redistribuição; verificar se linhas destacadas com `FRAUD-SRS` aparecem; revisar firewall/rota até `51.83.5.176:9877` se continuar vendo apenas `TIMEOUT`
+
+---
+
 ## [v0.02] - Em edição
 
 ### Novo

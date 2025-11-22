@@ -18,10 +18,10 @@ umask 022
 
 # Domínio principal do servidor de email
 # Exemplo: "meudominio.com" ou "empresa.com.br"
-MAIL_DOMAIN=""
+MAIL_DOMAIN="example.com"
 
 # Hostname do servidor (deixe vazio para detecção automática)
-MAIL_HOSTNAME=""
+MAIL_HOSTNAME="example.com"
 
 # ===================================================================
 # CONTROLE DE VERSÃO DA DASHBOARD
@@ -136,8 +136,9 @@ FIREWALL_SPFBL_PORTS=(
   "$DASHBOARD_HTTP_PORT"    # Dashboard HTTP (8002)
 )
 
-# Permitir porta administrativa (9875) apenas de localhost
-FIREWALL_ADMIN_PORT_LOOPBACK_ONLY="yes"
+# Permitir porta administrativa (9875) para acesso remoto (auto-registro)
+# Padrão: "no" = permite acesso remoto | "yes" = apenas localhost
+FIREWALL_ADMIN_PORT_LOOPBACK_ONLY="no"
 
 # CSF Firewall - configuração automática
 CSF_AUTO_CONFIG="yes"
@@ -169,6 +170,7 @@ SPFBL_LOG_DIR="/var/log/spfbl"
 SPFBL_HISTORY_DIR="$SPFBL_INSTALL_DIR/history"
 SPFBL_WEB_DIR="$SPFBL_INSTALL_DIR/web"
 SPFBL_PUBLIC_DIR="$SPFBL_WEB_DIR/public"
+FRAUD_EVENT_TOKEN_FILE="$SPFBL_INSTALL_DIR/data/fraud_token"
 DIRECTADMIN_DOC_URL="https://docs.directadmin.com/other-hosting-services/exim/configuring-exim.html"
 
 ###############################
@@ -183,6 +185,7 @@ DETECTED_HOSTNAME=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DATE="$(date +'%Y-%m-%d_%H-%M-%S')"
 CHANGELOG_FILE="$SCRIPT_DIR/CHANGELOG.md"
+FRAUD_EVENT_TOKEN=""
 
 # Detecta automaticamente a versão mais recente registrada no CHANGELOG.
 if [[ -f "$CHANGELOG_FILE" ]]; then
@@ -314,6 +317,23 @@ setup_local_hostname() {
   log "Hostname configurado: $DETECTED_HOSTNAME (IP: $SERVER_IP)"
 }
 
+validate_user_input() {
+  local missing=()
+
+  [[ -n "$MAIL_DOMAIN" ]] || missing+=("MAIL_DOMAIN")
+  [[ -n "$SPFBL_ADMIN_EMAIL" ]] || missing+=("SPFBL_ADMIN_EMAIL")
+
+  if ((${#missing[@]} > 0)); then
+    cat <<EOF
+Variáveis obrigatórias não foram configuradas:
+  - ${missing[*]}
+
+Edite o início deste script e defina valores válidos antes de executar novamente.
+EOF
+    die "Configuração incompleta. Itens pendentes: ${missing[*]}"
+  fi
+}
+
 ###############################
 # Etapas principais
 ###############################
@@ -334,7 +354,25 @@ detect_network() {
 }
 
 detect_public_ip() {
-  PUBLIC_IP="$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  PUBLIC_IP=""
+
+  if command -v curl >/dev/null 2>&1; then
+    PUBLIC_IP="$(
+      { curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '\r\n'; } || true
+    )"
+  fi
+
+  if [[ -z "$PUBLIC_IP" ]] && command -v wget >/dev/null 2>&1; then
+    PUBLIC_IP="$(
+      { wget -4 -qO- https://api.ipify.org 2>/dev/null | tr -d '\r\n'; } || true
+    )"
+  fi
+
+  if [[ -z "$PUBLIC_IP" ]] && command -v dig >/dev/null 2>&1; then
+    PUBLIC_IP="$(
+      { dig +short -4 myip.opendns.com @resolver1.opendns.com 2>/dev/null | tr -d '\r\n'; } || true
+    )"
+  fi
 
   # Verifica se o SERVER_IP é privado
   if is_private_ip "$SERVER_IP"; then
@@ -406,11 +444,15 @@ install_packages() {
 ensure_python2_default() {
   # Verificar se python2.7 existe
   if [[ -f /usr/bin/python2.7 ]]; then
-    if [[ -e /usr/bin/python && ! -L /usr/bin/python ]]; then
-      mv /usr/bin/python "/usr/bin/python.$(date +'%Y%m%d%H%M%S').bak"
+    if [[ ! -e /usr/bin/python ]]; then
+      ln -sf /usr/bin/python2.7 /usr/bin/python
+      log "✓ Python 2.7 configurado como padrão"
+    elif [[ -L /usr/bin/python ]]; then
+      ln -sf /usr/bin/python2.7 /usr/bin/python
+      log "✓ Python 2.7 configurado como padrão (atualizado symlink)"
+    else
+      log "⚠ /usr/bin/python já existe e não será modificado (preservando binário atual)"
     fi
-    ln -sf /usr/bin/python2.7 /usr/bin/python
-    log "✓ Python 2.7 configurado como padrão"
   elif [[ -f /usr/bin/python3 ]]; then
     # Se python2.7 não existe, usar python3
     if [[ ! -e /usr/bin/python ]]; then
@@ -827,6 +869,31 @@ configure_spfbl_accounts() {
   $SPFBL_CLIENT_BIN client add "$SPFBL_CLIENT_CIDR" "$SPFBL_CLIENT_LABEL" SPFBL "$SPFBL_ADMIN_EMAIL" >/dev/null 2>&1 || true
 }
 
+ensure_fraud_event_token() {
+  if [[ -n "$FRAUD_EVENT_TOKEN" && ${#FRAUD_EVENT_TOKEN} -ge 32 ]]; then
+    return 0
+  fi
+
+  if [[ -s "$FRAUD_EVENT_TOKEN_FILE" ]]; then
+    FRAUD_EVENT_TOKEN="$(<"$FRAUD_EVENT_TOKEN_FILE")"
+    return 0
+  fi
+
+  log "Gerando token exclusivo para eventos de fraude..."
+  mkdir -p "$(dirname "$FRAUD_EVENT_TOKEN_FILE")"
+
+  local token=""
+  if command -v openssl >/dev/null 2>&1; then
+    token="$(openssl rand -hex 32)"
+  else
+    token="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  fi
+
+  printf '%s\n' "$token" > "$FRAUD_EVENT_TOKEN_FILE"
+  chmod 600 "$FRAUD_EVENT_TOKEN_FILE"
+  FRAUD_EVENT_TOKEN="$token"
+}
+
 configure_authorized_servers() {
   local total_servers=0
   local authorized_list=()
@@ -1072,10 +1139,13 @@ configure_ufw_firewall() {
     log "  ✓ Porta $port permitida"
   done
 
-  # Permitir porta administrativa apenas de localhost
+  # Permitir porta administrativa
   if [[ "$FIREWALL_ADMIN_PORT_LOOPBACK_ONLY" == "yes" ]]; then
     ufw allow from 127.0.0.1 to any port "$SPFBL_ADMIN_PORT" proto tcp >/dev/null 2>&1 || true
     log "  ✓ Porta administrativa ($SPFBL_ADMIN_PORT) permitida apenas de localhost"
+  else
+    ufw allow "$SPFBL_ADMIN_PORT"/tcp >/dev/null 2>&1 || true
+    log "  ✓ Porta administrativa ($SPFBL_ADMIN_PORT) permitida"
   fi
 
   # Recarregar UFW para aplicar mudanças
@@ -1095,21 +1165,34 @@ configure_csf_firewall() {
     [[ "$port" == "${EXIM_SMTP_PORT}" ]] && continue
     [[ -n "$port" ]] && all_in_ports+=",${port}"
   done
-  all_in_ports+=",${SPFBL_ADMIN_PORT}"
 
-  # TCP_OUT - portas que aceitam conexões de saída (geralmente 1:65535 ou todas)
+  # Adicionar porta admin (permitir acesso remoto para auto-registro)
+  if [[ "$FIREWALL_ADMIN_PORT_LOOPBACK_ONLY" != "yes" ]]; then
+    all_in_ports+=",${SPFBL_ADMIN_PORT}"
+  fi
+
+  # TCP_OUT - portas que aceitam conexões de saída
   local all_out_ports="$all_in_ports"
 
   # Atualizar TCP_IN
   if ! grep -q "TCP_IN.*${FIREWALL_SSH_PORT}" /etc/csf/csf.conf; then
     sed -i "s/^TCP_IN = \"\(.*\)\"/TCP_IN = \"${all_in_ports}\"/" /etc/csf/csf.conf
-    log "  ✓ TCP_IN (entrada) atualizado com portas: $all_in_ports"
+    log "  ✓ TCP_IN atualizado: $all_in_ports"
   fi
 
   # Atualizar TCP_OUT
   if ! grep -q "TCP_OUT.*${FIREWALL_SSH_PORT}" /etc/csf/csf.conf; then
     sed -i "s/^TCP_OUT = \"\(.*\)\"/TCP_OUT = \"${all_out_ports}\"/" /etc/csf/csf.conf
-    log "  ✓ TCP_OUT (saída) atualizado com portas: $all_out_ports"
+    log "  ✓ TCP_OUT atualizado: $all_out_ports"
+  fi
+
+  # Se LOOPBACK_ONLY=yes, adicionar regra específica para localhost
+  if [[ "$FIREWALL_ADMIN_PORT_LOOPBACK_ONLY" == "yes" ]]; then
+    local localhost_rule="tcp|in|d=${SPFBL_ADMIN_PORT}|s=127.0.0.1"
+    if ! grep -q "$localhost_rule" /etc/csf/csf.allow 2>/dev/null; then
+      echo "$localhost_rule" >> /etc/csf/csf.allow
+      log "  ✓ Porta admin ($SPFBL_ADMIN_PORT) restrita a localhost"
+    fi
   fi
 
   # Reiniciar CSF
@@ -1179,6 +1262,9 @@ SPFBL_SERVER_IP="$SERVER_IP"
 SPFBL_POLICY_PORT="$SPFBL_POLICY_PORT"
 SPFBL_ADMIN_PORT="$SPFBL_ADMIN_PORT"
 SPFBL_CLIENT_URL="http://$SERVER_IP:$SPFBL_HTTP_PORT"
+SPFBL_CLIENT_DOWNLOAD_URL="$SPFBL_CLIENT_URL/public/spfbl-client"
+FRAUD_EVENT_ENDPOINT="http://$SERVER_IP:$DASHBOARD_HTTP_PORT/api/fraud-events"
+FRAUD_EVENT_TOKEN="$FRAUD_EVENT_TOKEN"
 BACKUP_DIR="/root/spfbl_backups"
 INSTALL_DATE="\$(date +'%Y-%m-%d_%H-%M-%S')"
 DIRECTADMIN_DOC_URL="https://docs.directadmin.com/other-hosting-services/exim/configuring-exim.html"
@@ -1237,6 +1323,49 @@ test_connectivity() {
   return 1
 }
 
+detect_my_ip() {
+  # Tentar detectar IP público
+  local public_ip
+  public_ip="$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+
+  # Se não conseguiu, tentar via ip route
+  if [[ -z "$public_ip" ]]; then
+    public_ip="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')"
+  fi
+
+  echo "$public_ip"
+}
+
+register_client_in_spfbl() {
+  local MY_IP
+  MY_IP="$(detect_my_ip)"
+
+  if [[ -z "$MY_IP" ]]; then
+    log "✗ Erro: não foi possível detectar o IP público"
+    log "  Comando: ssh root@$SPFBL_SERVER_IP '/sbin/spfbl client add <IP>/32 <hostname> SPFBL auto@<hostname>'"
+    return 1
+  fi
+
+  local HOSTNAME
+  HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
+  local CLIENT_EMAIL="auto@${HOSTNAME}"
+  local REGISTER_CMD="CLIENT ADD ${MY_IP}/32 ${HOSTNAME} SPFBL ${CLIENT_EMAIL}"
+
+  if command -v nc >/dev/null 2>&1; then
+    local response
+    response=$(echo "$REGISTER_CMD" | timeout 3 nc -w 2 "$SPFBL_SERVER_IP" "$SPFBL_ADMIN_PORT" 2>/dev/null || true)
+
+    if [[ "$response" =~ (ADDED|ALREADY) ]]; then
+      printf '\033[0;32m✓ Servidor registrado no SPFBL: %s (%s)\033[0m\n' "$HOSTNAME" "$MY_IP"
+      return 0
+    fi
+  fi
+
+  log "✗ Erro no auto-registro"
+  log "  Comando: ssh root@$SPFBL_SERVER_IP '/sbin/spfbl client add ${MY_IP}/32 ${HOSTNAME} SPFBL ${CLIENT_EMAIL}'"
+  return 1
+}
+
 print_exim_manual_steps() {
   log ""
   log "⚠ PASSO MANUAL NECESSÁRIO: recompilar e reiniciar o Exim"
@@ -1260,9 +1389,9 @@ install_dependencies() {
 
   if command -v apt-get >/dev/null; then
     apt-get update -qq
-    apt-get install -y nmap ncat wget >/dev/null 2>&1
+    apt-get install -y nmap ncat wget curl perl >/dev/null 2>&1
   elif command -v yum >/dev/null; then
-    yum install -y nmap nc wget >/dev/null 2>&1
+    yum install -y nmap nc wget curl perl >/dev/null 2>&1
   else
     die "Gerenciador de pacotes não identificado (apt-get ou yum)"
   fi
@@ -1270,45 +1399,58 @@ install_dependencies() {
   log "✓ Dependências instaladas"
 }
 
+download_spfbl_client() {
+  local destination="$1"
+  local temp_file
+  temp_file="$(mktemp /tmp/spfbl-client.XXXXXX)" || return 1
+
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsSL "$SPFBL_CLIENT_DOWNLOAD_URL" -o "$temp_file"; then
+      mv "$temp_file" "$destination"
+      return 0
+    fi
+  fi
+
+  if command -v wget >/dev/null 2>&1; then
+    if wget -qO "$temp_file" "$SPFBL_CLIENT_DOWNLOAD_URL"; then
+      mv "$temp_file" "$destination"
+      return 0
+    fi
+  fi
+
+  rm -f "$temp_file"
+  return 1
+}
+
 install_spfbl_client() {
   log "Instalando cliente SPFBL..."
 
-  local template_source="/opt/spfbl/tools/spfbl-client-template.sh"
   local target_path="/usr/local/bin/spfbl"
 
-  while true; do
-    read -rp "O cliente SPFBL já está presente em $target_path? [y/N] " copied
-    if [[ "$copied" =~ ^[Yy] ]]; then
-      if [[ -f "$target_path" ]]; then
-        break
-      fi
-      log "⚠ Arquivo $target_path não encontrado, mesmo depois da cópia."
-      log "  Verifique se o arquivo foi transferido corretamente para $target_path."
-    fi
-    log "⚠ Copiar o template do SPFBL é necessário para prosseguir."
-    log "  scp root@$SPFBL_SERVER_IP:$template_source $target_path"
-    log "  chmod +x $target_path"
-    log "  Reexecute este script após concluir a cópia."
-    read -rp "Deseja continuar a instalação (para repetir a pergunta) ou encerrar agora? [c/E] " decision
-    if [[ "$decision" =~ ^[Cc] ]]; then
-      continue
-    fi
-    log "Instalação interrompida. Copie o arquivo e execute novamente quando estiver pronto."
-    exit 1
-  done
-
   if [[ -f "$target_path" ]]; then
-    chmod +x "$target_path"
-    log "✓ Cliente em $target_path pronto para uso"
-  else
-    log "⚠ Arquivo esperado ($target_path) não encontrado; coloque o cliente neste caminho e execute novamente."
+    create_backup "$target_path"
+  fi
+
+  if ! download_spfbl_client "$target_path"; then
+    log "⚠ Não foi possível baixar automaticamente o cliente via HTTP."
+    log "  Acesse $SPFBL_CLIENT_DOWNLOAD_URL e transfira o arquivo manualmente para $target_path."
     exit 1
   fi
+
+  chmod 755 "$target_path"
+  log "✓ Cliente em $target_path pronto para uso"
 
   # Configurar IP do servidor
   sed -i "s|^IP_SERVIDOR=.*|IP_SERVIDOR=\"$SPFBL_SERVER_IP\"|" /usr/local/bin/spfbl
   sed -i "s|^PORTA_SERVIDOR=.*|PORTA_SERVIDOR=\"$SPFBL_POLICY_PORT\"|" /usr/local/bin/spfbl
   sed -i "s|^PORTA_ADMIN=.*|PORTA_ADMIN=\"$SPFBL_ADMIN_PORT\"|" /usr/local/bin/spfbl
+  sed -i "s|^SPFBL_FRAUD_ENDPOINT=.*|SPFBL_FRAUD_ENDPOINT=\"$FRAUD_EVENT_ENDPOINT\"|" /usr/local/bin/spfbl
+  sed -i "s|^SPFBL_FRAUD_TOKEN=.*|SPFBL_FRAUD_TOKEN=\"$FRAUD_EVENT_TOKEN\"|" /usr/local/bin/spfbl
+
+  mkdir -p /etc/spfbl
+  printf '%s\n' "$FRAUD_EVENT_ENDPOINT" >/etc/spfbl/fraud-endpoint
+  printf '%s\n' "$FRAUD_EVENT_TOKEN" >/etc/spfbl/fraud-token
+  chmod 600 /etc/spfbl/fraud-endpoint /etc/spfbl/fraud-token || true
 
   log "✓ Cliente SPFBL instalado e configurado"
 }
@@ -1319,9 +1461,13 @@ test_spfbl_client() {
   local result
   result=$(/usr/local/bin/spfbl query 8.8.8.8 teste@gmail.com google.com destinatario@teste.com 2>&1 || true)
 
-  if [[ "$result" =~ (PASS|NEUTRAL|NONE|WHITE) ]]; then
+  # Todas as respostas válidas do SPFBL (incluindo SOFTFAIL, FAIL, etc.)
+  if [[ "$result" =~ ^(PASS|FAIL|SOFTFAIL|NEUTRAL|NONE|WHITE|LISTED|GREYLIST|BLOCKED|BANNED|FLAG|SPAMTRAP|HOLD|LAN) ]]; then
     log "✓ Cliente SPFBL funcionando: $result"
     return 0
+  elif [[ -z "$result" ]]; then
+    log "⚠ AVISO: Cliente SPFBL não retornou resposta (possível erro de conectividade)"
+    return 1
   else
     log "⚠ AVISO: Resposta inesperada do SPFBL: $result"
     return 1
@@ -1356,6 +1502,15 @@ warn
 # Log da consulta
 warn
   log_message = SPFBL-CHECK: $acl_m_spfbl
+
+# Bloquear imediatamente resultados marcados como FRAUD
+warn
+  condition = ${if match{$acl_m_spfbl}{^FRAUD}{yes}{no}}
+  log_message = SPFBL-FRAUD: $acl_m_spfbl (host $sender_host_address)
+
+deny
+  condition = ${if match{$acl_m_spfbl}{^FRAUD}{yes}{no}}
+  message = Message rejected by SPFBL fraud protection
 
 # Rejeitar se BLOCKED ou BANNED
 deny
@@ -1501,6 +1656,7 @@ main() {
       install_dependencies
       install_spfbl_client
       test_spfbl_client || log "⚠ Continuando apesar da falha no teste..."
+      register_client_in_spfbl || log "⚠ Registro automático falhou - veja instruções acima"
       create_exim_integration
       show_integration_instructions
       ;;
@@ -1594,6 +1750,8 @@ SPFBL_POLICY_PORT="$SPFBL_POLICY_PORT"
 SPFBL_ADMIN_PORT="$SPFBL_ADMIN_PORT"
 SPFBL_HTTP_PORT="$SPFBL_HTTP_PORT"
 BASE_URL="http://\${SPFBL_SERVER}:\${SPFBL_HTTP_PORT}"
+FRAUD_EVENT_ENDPOINT="http://$server_ip:$DASHBOARD_HTTP_PORT/api/fraud-events"
+FRAUD_EVENT_TOKEN="$FRAUD_EVENT_TOKEN"
 
 # Email de contato para registro automático do cliente no SPFBL (opcional).
 # Se vazio, será usado auto@<hostname_do_DirectAdmin>.
@@ -1728,6 +1886,13 @@ log "✓ Cliente SPFBL instalado"
 sed -i "s|^IP_SERVIDOR=.*|IP_SERVIDOR=\"$SPFBL_SERVER\"|" /usr/local/bin/spfbl
 sed -i "s|^PORTA_SERVIDOR=.*|PORTA_SERVIDOR=\"$SPFBL_POLICY_PORT\"|" /usr/local/bin/spfbl
 sed -i "s|^PORTA_ADMIN=.*|PORTA_ADMIN=\"$SPFBL_ADMIN_PORT\"|" /usr/local/bin/spfbl
+sed -i "s|^SPFBL_FRAUD_ENDPOINT=.*|SPFBL_FRAUD_ENDPOINT=\"$FRAUD_EVENT_ENDPOINT\"|" /usr/local/bin/spfbl
+sed -i "s|^SPFBL_FRAUD_TOKEN=.*|SPFBL_FRAUD_TOKEN=\"$FRAUD_EVENT_TOKEN\"|" /usr/local/bin/spfbl
+
+mkdir -p /etc/spfbl
+printf '%s\n' "$FRAUD_EVENT_ENDPOINT" >/etc/spfbl/fraud-endpoint
+printf '%s\n' "$FRAUD_EVENT_TOKEN" >/etc/spfbl/fraud-token
+chmod 600 /etc/spfbl/fraud-endpoint /etc/spfbl/fraud-token || true
 
 # Testar cliente
 log "Testando cliente SPFBL..."
@@ -1743,58 +1908,15 @@ else
 fi
 
 # Auto-registrar este servidor no SPFBL
-log "Auto-registrando servidor no SPFBL..."
 HOSTNAME="$(hostname -f 2>/dev/null || hostname)"
-
-# Definir email de contato usado no registro (padrão: auto@<hostname_do_DirectAdmin>)
 CLIENT_EMAIL="${CLIENT_REGISTER_EMAIL:-auto@${HOSTNAME}}"
-
-# Tentar registrar via comando direto (requer que porta admin esteja acessível)
-# Normalmente a porta admin está bloqueada externamente, então fornecemos o comando
 AUTO_REGISTER_CMD="CLIENT ADD ${MY_IP}/32 ${HOSTNAME} SPFBL ${CLIENT_EMAIL}"
 
-# Tentar via netcat (pode não funcionar se porta admin estiver bloqueada)
-if echo "$AUTO_REGISTER_CMD" | timeout 2 nc -w 1 $SPFBL_SERVER $SPFBL_ADMIN_PORT 2>/dev/null | grep -q "OK"; then
-  log "✓ Servidor registrado automaticamente no SPFBL"
+if echo "$AUTO_REGISTER_CMD" | timeout 2 nc -w 1 $SPFBL_SERVER $SPFBL_ADMIN_PORT 2>/dev/null | grep -q -E "(ADDED|ALREADY)"; then
+  printf '\033[0;32m✓ Servidor registrado no SPFBL: %s (%s)\033[0m\n' "$HOSTNAME" "$MY_IP"
 else
-  # Auto-registro via porta admin não funcionou (esperado por segurança)
-  # Criar um arquivo de solicitação
-  REGISTER_REQUEST="/tmp/spfbl-register-request-${MY_IP//\./_}.txt"
-  cat > "$REGISTER_REQUEST" <<EOFREQ
-╔════════════════════════════════════════════════════════════════╗
-║          SOLICITAÇÃO DE REGISTRO NO SERVIDOR SPFBL             ║
-╚════════════════════════════════════════════════════════════════╝
-
-IP do cliente:    ${MY_IP}
-Hostname:         ${HOSTNAME}
-Data/Hora:        $(date)
-
-────────────────────────────────────────────────────────────────
-
-COMANDO PARA EXECUTAR NO SERVIDOR SPFBL ($SPFBL_SERVER):
-
-  /sbin/spfbl client add ${MY_IP}/32 ${HOSTNAME} SPFBL ${CLIENT_EMAIL}
-
-────────────────────────────────────────────────────────────────
-
-INSTRUÇÕES:
-
-1. Copie este arquivo para o servidor SPFBL ou
-2. Execute o comando acima diretamente no servidor SPFBL
-
-Após registrar, teste a conexão com:
-  /usr/local/bin/spfbl query 8.8.8.8 test@example.com example.com user@domain.com
-
-────────────────────────────────────────────────────────────────
-EOFREQ
-
-  log "⚠ Auto-registro via rede não disponível (porta admin protegida)"
-  log ""
-  log "  Arquivo de solicitação criado: $REGISTER_REQUEST"
-  log ""
-  log "  EXECUTE NO SERVIDOR SPFBL ($SPFBL_SERVER):"
-  log "  /sbin/spfbl client add ${MY_IP}/32 ${HOSTNAME} SPFBL ${CLIENT_EMAIL}"
-  log ""
+  log "✗ Erro no auto-registro"
+  log "  Comando: ssh root@$SPFBL_SERVER '/sbin/spfbl client add ${MY_IP}/32 ${HOSTNAME} SPFBL ${CLIENT_EMAIL}'"
 fi
 
 # Criar backup
@@ -1829,6 +1951,15 @@ warn
 # Log da consulta
 warn
   log_message = SPFBL-CHECK: $acl_m_spfbl
+
+# Bloquear imediatamente resultados marcados como FRAUD
+warn
+  condition = ${if match{$acl_m_spfbl}{^FRAUD}{yes}{no}}
+  log_message = SPFBL-FRAUD: $acl_m_spfbl (host $sender_host_address)
+
+deny
+  condition = ${if match{$acl_m_spfbl}{^FRAUD}{yes}{no}}
+  message = Message rejected by SPFBL fraud protection
 
 # Rejeitar se BLOCKED ou BANNED
 deny
@@ -2479,10 +2610,11 @@ REGINFO
 
 main() {
   require_root
+  validate_user_input
   log "Iniciando instalação do SPFBL RBL..."
   detect_network
-  detect_public_ip
   install_packages
+  detect_public_ip
   ensure_python2_default
   stop_existing_spfbl
   detect_and_configure_jvm_memory
@@ -2511,6 +2643,7 @@ main() {
   configure_firewall
   verify_installation
   setup_web_distribution
+  ensure_fraud_event_token
   create_auto_register_script
   install_new_dashboard
   write_remote_guidance

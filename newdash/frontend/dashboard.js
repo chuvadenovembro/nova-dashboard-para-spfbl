@@ -3,6 +3,7 @@
 const API_URL = "/api";
 const REFRESH_INTERVAL = 60000; // 60 seconds para reduzir carga
 const THEME_KEY = 'dashboardTheme';
+const MOBILE_BREAKPOINT = 768;
 const SUN_ICON = `
 <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
   <circle cx="12" cy="12" r="4"></circle>
@@ -24,6 +25,7 @@ const MOON_ICON = `
 let charts = {};
 let queries = [];
 let refreshTimer;
+let selectedQueryId = null;
 
 const HTML_ESCAPE_MAP = {
     '&': '&amp;',
@@ -40,43 +42,133 @@ function escapeHtml(value) {
     return value.toString().replace(/[&<>"']/g, char => HTML_ESCAPE_MAP[char]);
 }
 
-// Sidebar Toggle
-function toggleSidebar() {
-    const sidebar = document.getElementById('sidebar');
-    const logo = document.querySelector('.logo img');
-    const isCollapsed = sidebar.classList.contains('collapsed');
+function isMobileViewport() {
+    return window.innerWidth <= MOBILE_BREAKPOINT;
+}
 
-    if (isCollapsed) {
-        sidebar.classList.remove('collapsed');
-        if (logo) {
-            logo.style.maxWidth = '200px';
-            logo.style.maxHeight = '50px';
+function safeString(value) {
+    if (value === null || value === undefined) {
+        return '';
+    }
+    return String(value);
+}
+
+function generateRowId(index) {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return `query-${index}-${crypto.randomUUID()}`;
+    }
+    return `query-${index}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeQuery(rawQuery, index) {
+    const normalized = {
+        ...rawQuery,
+        timestamp: safeString(rawQuery?.timestamp),
+        ip: safeString(rawQuery?.ip),
+        sender: safeString(rawQuery?.sender),
+        recipient: safeString(rawQuery?.recipient),
+        helo: safeString(rawQuery?.helo),
+        result: safeString(rawQuery?.result || 'N/A').toUpperCase(),
+        _rowId: rawQuery?._rowId || generateRowId(index)
+    };
+    return normalized;
+}
+
+function normalizeQueries(rawQueries) {
+    return (rawQueries || []).map((query, index) => normalizeQuery(query, index));
+}
+
+function formatRelativeTime(timestamp) {
+    if (!timestamp) {
+        return '';
+    }
+    try {
+        const date = new Date(timestamp);
+        if (Number.isNaN(date.getTime())) {
+            return '';
         }
-        localStorage.setItem('sidebarCollapsed', 'false');
-    } else {
-        sidebar.classList.add('collapsed');
-        if (logo) {
-            logo.style.maxWidth = '40px';
-            logo.style.maxHeight = '40px';
+        const diffMs = Date.now() - date.getTime();
+        if (diffMs < 0) {
+            return '';
         }
-        localStorage.setItem('sidebarCollapsed', 'true');
+        const minutes = Math.floor(diffMs / 60000);
+        if (minutes < 1) {
+            return 'há instantes';
+        }
+        if (minutes < 60) {
+            return `há ${minutes}m`;
+        }
+        const hours = Math.floor(minutes / 60);
+        if (hours < 24) {
+            const restMinutes = minutes % 60;
+            return restMinutes > 0 ? `há ${hours}h ${restMinutes}m` : `há ${hours}h`;
+        }
+        const days = Math.floor(hours / 24);
+        return `há ${days}d`;
+    } catch (error) {
+        return '';
     }
 }
 
-function restoreSidebarState() {
-    const isCollapsed = localStorage.getItem('sidebarCollapsed') === 'true';
-    const sidebar = document.getElementById('sidebar');
+// Sidebar Toggle
+function setSidebarLogoSize(isCompact) {
     const logo = document.querySelector('.logo img');
-    if (isCollapsed) {
-        sidebar.classList.add('collapsed');
-        if (logo) {
-            logo.style.maxWidth = '40px';
-            logo.style.maxHeight = '40px';
-        }
-    } else if (logo) {
+    if (!logo) {
+        return;
+    }
+    if (isCompact) {
+        logo.style.maxWidth = '40px';
+        logo.style.maxHeight = '40px';
+    } else {
         logo.style.maxWidth = '200px';
         logo.style.maxHeight = '50px';
     }
+}
+
+function toggleSidebar() {
+    if (isMobileViewport()) {
+        return;
+    }
+    const sidebar = document.getElementById('sidebar');
+    if (!sidebar) {
+        return;
+    }
+    const willCollapse = !sidebar.classList.contains('collapsed');
+    sidebar.classList.toggle('collapsed');
+    setSidebarLogoSize(willCollapse);
+    localStorage.setItem('sidebarCollapsed', willCollapse ? 'true' : 'false');
+}
+
+function applyDesktopSidebarState() {
+    const sidebar = document.getElementById('sidebar');
+    if (!sidebar) {
+        return;
+    }
+    const isCollapsed = localStorage.getItem('sidebarCollapsed') === 'true';
+    sidebar.classList.toggle('collapsed', isCollapsed);
+    setSidebarLogoSize(isCollapsed);
+}
+
+function applySidebarLayout() {
+    const sidebar = document.getElementById('sidebar');
+    if (!sidebar) {
+        return;
+    }
+
+    if (isMobileViewport()) {
+        sidebar.classList.remove('collapsed');
+        sidebar.classList.add('mobile-top');
+        setSidebarLogoSize(true);
+        return;
+    }
+
+    sidebar.classList.remove('mobile-top');
+    applyDesktopSidebarState();
+}
+
+function initializeSidebar() {
+    applySidebarLayout();
+    window.addEventListener('resize', applySidebarLayout);
 }
 
 // Theme Toggle
@@ -110,7 +202,7 @@ function renderThemeIcon() {
 
 // Initialize dashboard
 document.addEventListener('DOMContentLoaded', () => {
-    restoreSidebarState();
+    initializeSidebar();
     restoreTheme();
     renderThemeIcon();
     initCharts();
@@ -425,8 +517,9 @@ async function loadQueries() {
     try {
         const response = await fetch(`${API_URL}/queries`);
         const data = await response.json();
-        queries = data.queries || [];
-
+        queries = normalizeQueries(data.queries || []);
+        selectedQueryId = null;
+        updateSelectedQueryPanel();
         displayQueries(queries);
     } catch (error) {
         console.error('Error loading queries:', error);
@@ -439,30 +532,53 @@ function displayQueries(queriesToDisplay) {
     const tbody = document.getElementById('queries-tbody');
 
     if (!queriesToDisplay || queriesToDisplay.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="7" class="loading">Nenhuma consulta encontrada</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="loading">Nenhuma consulta encontrada</td></tr>';
+        updateSelectedQueryPanel();
         return;
+    }
+
+    if (selectedQueryId && !queriesToDisplay.some(q => q._rowId === selectedQueryId)) {
+        selectedQueryId = null;
     }
 
     const placeholder = '<span class="muted-text">--</span>';
 
     tbody.innerHTML = queriesToDisplay.map(q => {
-        const time = escapeHtml(formatTimestamp(q.timestamp));
-        const rawIp = q.ip || '';
-        const ip = rawIp ? escapeHtml(rawIp) : '';
-        const ipDisplay = rawIp.length > 15 ? escapeHtml(rawIp.slice(0, 15)) : ip;
+        const rowId = q._rowId;
+        const isSelected = rowId === selectedQueryId;
+        const time = q.timestamp ? escapeHtml(formatTimestamp(q.timestamp)) : placeholder;
+        const relativeTime = q.timestamp ? formatRelativeTime(q.timestamp) : '';
+        const relativeHtml = relativeTime ? `<span class="query-meta-sub">${escapeHtml(relativeTime)}</span>` : '';
+        const ip = q.ip ? escapeHtml(q.ip) : '';
+        const ipDisplay = q.ip && q.ip.length > 18 ? `${escapeHtml(q.ip.slice(0, 18))}...` : ip;
         const helo = q.helo ? escapeHtml(q.helo) : '';
         const sender = q.sender ? escapeHtml(q.sender) : '';
         const recipient = q.recipient ? escapeHtml(q.recipient) : '';
-        const result = (q.result || 'N/A').toUpperCase();
+        const result = q.result || 'N/A';
         const resultSlug = result.replace(/[^a-z0-9_-]/gi, '') || 'UNKNOWN';
-        const resultBadge = `<span class="result-badge result-${resultSlug}">${escapeHtml(result)}</span>`;
-        const ipForAction = (q.ip || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-        const senderForAction = (q.sender || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        const resultBadge = `<span class="result-badge result-chip result-${resultSlug}">${escapeHtml(result)}</span>`;
 
         return `
-            <tr>
+            <tr
+                class="query-row ${isSelected ? 'selected' : ''}"
+                data-row-id="${rowId}"
+                tabindex="0"
+                role="button"
+                aria-pressed="${isSelected ? 'true' : 'false'}"
+                onclick="selectQuery('${rowId}')"
+                onkeydown="handleQueryRowKey(event, '${rowId}')"
+            >
                 <td class="cell-time" data-label="Horário">
-                    <span class="query-time">${time}</span>
+                    <div class="query-meta">
+                        <span class="query-select-indicator" aria-hidden="true"></span>
+                        <div class="query-meta-details">
+                            <span class="query-time">${time}</span>
+                            ${relativeHtml}
+                        </div>
+                    </div>
+                </td>
+                <td class="cell-result" data-label="Resultado">
+                    ${resultBadge}
                 </td>
                 <td class="cell-ip" data-label="IP Origem">
                     ${ip ? `<code class="mono mono-truncate" title="${ip}">${ipDisplay}</code>` : placeholder}
@@ -470,29 +586,127 @@ function displayQueries(queriesToDisplay) {
                 <td class="cell-sender" data-label="Remetente">
                     ${sender ? `<span class="address-pill subtle" title="${sender}">${sender}</span>` : placeholder}
                 </td>
-                <td class="cell-helo" data-label="HELO">
-                    ${helo ? `<span class="text-truncate" title="${helo}">${helo}</span>` : placeholder}
-                </td>
                 <td class="cell-recipient" data-label="Destinatário">
                     ${recipient ? `<span class="address-pill subtle" title="${recipient}">${recipient}</span>` : placeholder}
                 </td>
-                <td class="cell-result" data-label="Resultado">
-                    ${resultBadge}
-                </td>
-                <td class="cell-actions action-buttons" data-label="Ações">
-                    <button class="btn-action btn-block" onclick="handleBlockIP('${ipForAction}')" title="Bloquear IP">
-                        <span class="icon">⛔</span>
-                    </button>
-                    <button class="btn-action btn-white" onclick="handleWhitelistIP('${ipForAction}')" title="Adicionar à Whitelist">
-                        <span class="icon">✅</span>
-                    </button>
-                    <button class="btn-action btn-block" onclick="handleBlockSender('${senderForAction}')" title="Bloquear Remetente">
-                        <span class="icon">📧</span>
-                    </button>
+                <td class="cell-helo" data-label="HELO">
+                    ${helo ? `<span class="text-truncate" title="${helo}">${helo}</span>` : placeholder}
                 </td>
             </tr>
         `;
     }).join('');
+
+    updateRowSelectionState();
+    updateSelectedQueryPanel();
+}
+
+function handleQueryRowKey(event, rowId) {
+    if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        selectQuery(rowId);
+    }
+}
+
+function selectQuery(rowId) {
+    if (!rowId) {
+        return;
+    }
+
+    selectedQueryId = selectedQueryId === rowId ? null : rowId;
+    updateRowSelectionState();
+    updateSelectedQueryPanel();
+}
+
+function clearSelectedQuery() {
+    selectedQueryId = null;
+    updateRowSelectionState();
+    updateSelectedQueryPanel();
+}
+
+function updateRowSelectionState() {
+    const rows = document.querySelectorAll('#queries-tbody .query-row');
+    rows.forEach(row => {
+        const isSelected = row.dataset.rowId === selectedQueryId;
+        row.classList.toggle('selected', isSelected);
+        row.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+    });
+}
+
+function getSelectedQuery() {
+    if (!selectedQueryId) {
+        return null;
+    }
+    return queries.find(q => q._rowId === selectedQueryId) || null;
+}
+
+function updateSelectedQueryPanel() {
+    const info = document.getElementById('selected-query-info');
+    const panel = document.getElementById('selected-query-panel');
+    const blockIpBtn = document.getElementById('action-block-ip');
+    const whitelistBtn = document.getElementById('action-whitelist-ip');
+    const blockSenderBtn = document.getElementById('action-block-sender');
+    const clearBtn = document.getElementById('action-clear-selection');
+
+    if (!info || !panel) {
+        return;
+    }
+
+    const selected = getSelectedQuery();
+
+    if (!selected) {
+        info.innerHTML = '<span class="placeholder">Nenhuma consulta selecionada</span>';
+        panel.classList.remove('has-selection');
+        [blockIpBtn, whitelistBtn, blockSenderBtn, clearBtn].forEach(btn => {
+            if (btn) {
+                btn.disabled = true;
+            }
+        });
+        return;
+    }
+
+    panel.classList.add('has-selection');
+    const resultSlug = selected.result.replace(/[^a-z0-9_-]/gi, '') || 'UNKNOWN';
+    const resultBadge = `<span class="result-badge result-chip result-${resultSlug} selected-query-result">${escapeHtml(selected.result)}</span>`;
+    const formattedTime = selected.timestamp ? escapeHtml(formatTimestamp(selected.timestamp)) : '--:--';
+    const summary = `
+        ${resultBadge}
+        <strong>${escapeHtml(selected.ip || '--')}</strong>
+        <span class="selected-query-arrow">&rarr;</span>
+        <strong>${escapeHtml(selected.recipient || '--')}</strong>
+        <span class="selected-query-meta">${formattedTime}</span>
+    `;
+    info.innerHTML = summary;
+
+    [blockIpBtn, whitelistBtn, blockSenderBtn, clearBtn].forEach(btn => {
+        if (btn) {
+            btn.disabled = false;
+        }
+    });
+}
+
+function handleSelectedAction(action) {
+    const selected = getSelectedQuery();
+    if (!selected) {
+        return;
+    }
+
+    if ((action === 'block-ip' || action === 'whitelist-ip') && !selected.ip) {
+        alert('A consulta selecionada não possui IP válido.');
+        return;
+    }
+
+    if (action === 'block-sender' && !selected.sender) {
+        alert('A consulta selecionada não possui remetente válido.');
+        return;
+    }
+
+    if (action === 'block-ip') {
+        handleBlockIP(selected.ip);
+    } else if (action === 'whitelist-ip') {
+        handleWhitelistIP(selected.ip);
+    } else if (action === 'block-sender') {
+        handleBlockSender(selected.sender);
+    }
 }
 
 // Load Servers
