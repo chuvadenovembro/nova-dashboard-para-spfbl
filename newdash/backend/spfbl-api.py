@@ -21,6 +21,7 @@ import html
 import ipaddress
 import math
 import glob
+import threading
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -84,6 +85,15 @@ def load_allowed_origins():
     return origins
 
 ALLOWED_ORIGINS = load_allowed_origins()
+
+# Cache para evitar fetch constante ao GitHub (endpoint público de update)
+try:
+    UPDATE_CACHE_SECONDS = int(os.environ.get('SPFBL_UPDATE_CACHE_SECONDS', '600'))
+except Exception:
+    UPDATE_CACHE_SECONDS = 600
+
+update_cache = {'checked_at': 0.0, 'payload': None}
+update_cache_lock = threading.Lock()
 
 # Addons (caminho único, relativo à instalação)
 SUBDOMAIN_CAMPAIGN_SERVICE = None
@@ -305,6 +315,11 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 self.send_json_response({'error': 'Email is required'}, 400)
             return
 
+        # Endpoint público para verificar update (usa cache interno)
+        if path == '/api/check-update':
+            self.check_github_update()
+            return
+
         # Endpoint público para obter configuração do reCAPTCHA
         if path == '/api/config/recaptcha':
             recaptcha_config = self.get_recaptcha_keys()
@@ -331,7 +346,6 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             '/api/fraud-events',
             '/api/addon/subdomain-campaign/config',
             '/api/addon/subdomain-campaign/scan',
-            '/api/check-update',
         }
         if path in admin_only_get:
             if not self.require_admin():
@@ -380,8 +394,6 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.handle_subdomain_campaign_scan()
         elif path == '/api/settings/config':
             self.handle_config()
-        elif path == '/api/check-update':
-            self.check_github_update()
         # Serve static files / dynamic settings page
         elif path in ['/', '/dashboard', '/dashboard.html']:
             self.serve_file(os.path.join(WEB_DIR, 'dashboard.html'), 'text/html')
@@ -3418,16 +3430,21 @@ document.addEventListener('DOMContentLoaded', function() {
         """Check for updates from GitHub CHANGELOG"""
         try:
             import urllib.request
-            changelog_url = (os.environ.get('SPFBL_DASH_CHANGELOG_RAW_URL') or '').strip()
-            changelog_web_url = (os.environ.get('SPFBL_DASH_CHANGELOG_WEB_URL') or '').strip()
+            now_ts = time.time()
+            with update_cache_lock:
+                cached = update_cache.get('payload')
+                checked_at = update_cache.get('checked_at', 0.0) or 0.0
+                if cached and (now_ts - checked_at) < UPDATE_CACHE_SECONDS:
+                    self.send_json_response(cached)
+                    return
 
-            if not changelog_url:
-                self.send_json_response({
-                    'success': False,
-                    'error': 'Update check disabled (configure SPFBL_DASH_CHANGELOG_RAW_URL)',
-                    'update_available': False
-                })
-                return
+            # URLs de changelog:
+            # - Por padrão usa o repositório oficial da nova dashboard.
+            # - Pode ser sobrescrito por variáveis de ambiente.
+            default_raw = 'https://raw.githubusercontent.com/chuvadenovembro/nova-dashboard-para-spfbl/main/CHANGELOG.md'
+            default_web = 'https://github.com/chuvadenovembro/nova-dashboard-para-spfbl/blob/main/CHANGELOG.md'
+            changelog_url = (os.environ.get('SPFBL_DASH_CHANGELOG_RAW_URL') or default_raw).strip()
+            changelog_web_url = (os.environ.get('SPFBL_DASH_CHANGELOG_WEB_URL') or default_web).strip()
 
             # Fetch do GitHub
             with urllib.request.urlopen(changelog_url, timeout=5) as response:
@@ -3467,13 +3484,17 @@ document.addEventListener('DOMContentLoaded', function() {
 
             comparison = compare_versions(local_version, latest_version)
 
-            self.send_json_response({
+            payload = {
                 'success': True,
                 'local_version': local_version,
                 'latest_version': latest_version,
                 'update_available': comparison < 0,
                 'changelog_url': changelog_web_url or changelog_url
-            })
+            }
+            with update_cache_lock:
+                update_cache['payload'] = payload
+                update_cache['checked_at'] = now_ts
+            self.send_json_response(payload)
         except urllib.error.URLError as e:
             self.send_json_response({
                 'success': False,
