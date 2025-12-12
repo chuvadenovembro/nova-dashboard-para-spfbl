@@ -288,6 +288,67 @@
             color: var(--text-secondary);
             flex-wrap: wrap;
         }
+
+        /* Estilos para proteção/lock */
+        .protected-alert {
+            background: linear-gradient(135deg, #fef3c7 0%, #fcd34d 100%);
+            border: 2px solid #f59e0b;
+            border-radius: 12px;
+            padding: 3rem 2rem;
+            margin-bottom: 2rem;
+            text-align: center;
+            box-shadow: 0 10px 25px rgba(245, 158, 11, 0.2);
+        }
+
+        .protected-alert h1 {
+            margin: 0 0 1rem 0;
+            font-size: 2.5rem;
+            color: #92400e;
+        }
+
+        .protected-alert p {
+            margin: 0.5rem 0;
+            font-size: 1.1rem;
+            color: #78350f;
+            line-height: 1.6;
+        }
+
+        .protected-alert-icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+        }
+
+        .protected-alert .action-text {
+            margin-top: 1.5rem;
+            font-weight: 600;
+            color: #92400e;
+            background: rgba(0, 0, 0, 0.08);
+            padding: 1rem;
+            border-radius: 8px;
+            font-size: 0.95rem;
+        }
+
+        body.theme-dark .protected-alert {
+            background: linear-gradient(135deg, #78350f 0%, #92400e 100%);
+            border-color: #f59e0b;
+        }
+
+        body.theme-dark .protected-alert h1 {
+            color: #fcd34d;
+        }
+
+        body.theme-dark .protected-alert p {
+            color: #fed7aa;
+        }
+
+        body.theme-dark .protected-alert .action-text {
+            background: rgba(255, 255, 255, 0.1);
+            color: #fcd34d;
+        }
+
+        .hidden {
+            display: none !important;
+        }
     </style>
 </head>
 <body>
@@ -318,12 +379,22 @@
 
             <div class="settings-container">
                 <div class="settings-content">
+                    <!-- Aviso de proteção (mostrado se locked) -->
+                    <div id="protected-section" class="protected-alert hidden">
+                        <div class="protected-alert-icon">🔐</div>
+                        <h1>Configuração Protegida</h1>
+                        <p>Esta configuração está protegida e não pode ser acessada ou editada.</p>
+                        <div class="action-text">
+                            ⚠️ Para desbloquear, remova ou renomeie o arquivo de proteção no servidor.
+                        </div>
+                    </div>
+
+                    <!-- Editor normal (mostrado se não locked) -->
                     <div id="config" class="settings-section active">
                         <div class="config-info">
                             <h4>📝 Editor de Configuração</h4>
-                            <p>Edite o arquivo do SPFBL diretamente no servidor. O conteúdo é carregado de <span class="file-path">/opt/spfbl/spfbl.conf</span> e salvo preservando a codificação UTF-8.</p>
+                            <p>Edite o arquivo do SPFBL diretamente no servidor. O conteúdo é carregado e salvo preservando a codificação UTF-8.</p>
                             <div class="flex-row">
-                                <span class="pill">📄 /opt/spfbl/spfbl.conf</span>
                                 <span class="pill">💾 Backup automático antes de salvar</span>
                                 <span class="pill">🔒 Requer sessão autenticada</span>
                             </div>
@@ -339,7 +410,7 @@
                             <div class="section-header">
                                 <div>
                                     <h4>Arquivo completo</h4>
-                                    <p class="editor-description">Visualize e altere o conteúdo integral do <span class="file-path">spfbl.conf</span>. Use com atenção.</p>
+                                    <p class="editor-description">Visualize e altere o conteúdo integral. Use com atenção.</p>
                                 </div>
                                 <div class="counts">
                                     <span><strong id="line-count">[[LINE_COUNT]]</strong> linhas</span>
@@ -379,6 +450,8 @@
             const reloadBtn = document.getElementById('reload-btn');
             const configForm = document.getElementById('config-form');
             const statusBanner = document.getElementById('status-banner');
+            const configSection = document.getElementById('config');
+            const protectedSection = document.getElementById('protected-section');
 
             let lastLoadedContent = '';
             let isSaving = false;
@@ -390,6 +463,16 @@
                 statusBanner.style.display = message ? 'block' : 'none';
             };
 
+            const showProtectedAlert = () => {
+                configSection?.classList.remove('active');
+                protectedSection?.classList.remove('hidden');
+            };
+
+            const hideProtectedAlert = () => {
+                configSection?.classList.add('active');
+                protectedSection?.classList.add('hidden');
+            };
+
             const updateCounters = () => {
                 if (!configEditor || !lineCountEl || !charCountEl) return;
                 const value = configEditor.value || '';
@@ -399,9 +482,6 @@
 
             const toggleSaving = (state) => {
                 isSaving = state;
-                const action = state ? 'add' : 'remove';
-                saveBtn?.setAttribute('aria-busy', state);
-                reloadBtn?.setAttribute('aria-busy', state);
                 if (state) {
                     saveBtn?.setAttribute('disabled', 'disabled');
                     reloadBtn?.setAttribute('disabled', 'disabled');
@@ -412,10 +492,9 @@
             };
 
             const loadConfig = async (showMessage = true) => {
-                if (!configEditor) return;
                 try {
                     if (showMessage) {
-                        setStatus('Carregando configuração do servidor...', 'info');
+                        setStatus('Verificando status da configuração...', 'info');
                     }
 
                     const response = await fetch(CONFIG_ENDPOINT, { credentials: 'include' });
@@ -429,16 +508,29 @@
                         throw new Error(data.error || 'Não foi possível ler o arquivo de configuração');
                     }
 
+                    // Se configuração está bloqueada, mostrar APENAS o alerta
+                    if (data.locked) {
+                        showProtectedAlert();
+                        // Limpar qualquer mensagem de status
+                        setStatus('', 'info');
+                        return;
+                    }
+
+                    // Se chegou aqui, não está bloqueada - carregar configuração
+                    hideProtectedAlert();
+
+                    if (!configEditor) return;
+
                     if (typeof data.content === 'string') {
                         configEditor.value = data.content;
                         lastLoadedContent = data.content;
                         updateCounters();
                     }
 
-                    setStatus(`Configuração carregada de ${data.path || '/opt/spfbl/spfbl.conf'}`, 'success');
+                    setStatus('Configuração carregada com sucesso', 'success');
                 } catch (error) {
                     setStatus(error?.message || 'Erro ao carregar configuração', 'error');
-                    updateCounters();
+                    if (configEditor) updateCounters();
                 }
             };
 
@@ -467,6 +559,12 @@
                     }
 
                     const data = await response.json().catch(() => ({}));
+
+                    // Se retornar locked, mostrar alerta
+                    if (response.status === 403 || data.locked) {
+                        showProtectedAlert();
+                        throw new Error('Configuração protegida. Não é possível salvar.');
+                    }
 
                     if (!response.ok || data.error || data.success === false) {
                         throw new Error(data.error || data.message || 'Erro ao salvar configuração');
@@ -497,7 +595,7 @@
                 loadConfig(true);
             });
 
-            // Se servidor já preencheu, reutiliza conteúdo inicial; depois busca a versão atual
+            // Se servidor já preencheu, reutiliza conteúdo inicial
             if (configEditor && configEditor.value && !configEditor.value.includes('[[CONFIG_CONTENT]]')) {
                 lastLoadedContent = configEditor.value;
                 updateCounters();

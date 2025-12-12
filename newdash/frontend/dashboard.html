@@ -4,11 +4,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SPFBL Dashboard - Painel Administrativo</title>
-    <link rel="stylesheet" href="dashboard.css">
+    <link rel="stylesheet" href="dashboard.css?v=notify-fix">
     <script src="version.js" defer></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
+    <!-- Sistema de Notificações -->
+    <div id="notification-container" class="notification-container" style="position: fixed; bottom: 20px; right: 20px; z-index: 10000;"></div>
+
     <div class="container">
         <!-- Sidebar -->
         <aside class="sidebar" id="sidebar">
@@ -35,10 +38,6 @@
                     <span class="icon">👥</span>
                     Usuários
                 </a>
-                <a href="#stats" class="nav-item" onclick="showSection('stats', event)" data-label="Estatísticas">
-                    <span class="icon">📈</span>
-                    Estatísticas
-                </a>
                 <a href="#lists" class="nav-item" onclick="showSection('lists', event)" data-label="Listas (Block/White)">
                     <span class="icon">📋</span>
                     Listas (Block/White)
@@ -50,6 +49,10 @@
                 <a href="#logs" class="nav-item" onclick="showSection('logs', event)" data-label="Logs">
                     <span class="icon">📜</span>
                     Logs
+                </a>
+                <a href="#subdomain-campaign" class="nav-item" onclick="showSection('subdomain-campaign', event)" data-label="Campanhas de Spam">
+                    <span class="icon">🎯</span>
+                    Campanhas de Spam
                 </a>
             </nav>
             <div class="sidebar-footer">
@@ -66,6 +69,12 @@
                 <h2 id="page-title">Dashboard</h2>
                 <div class="header-actions">
                     <span class="last-update">Última atualização: <span id="last-update">--:--</span></span>
+                    <button id="smtp-toggle" class="icon-btn" onclick="toggleSmtpNotifications()" title="Ativar/Desativar envio de e-mails do SPFBL">
+                        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                            <rect x="3" y="5" width="18" height="14" rx="2" ry="2"></rect>
+                            <polyline points="3 7 12 13 21 7"></polyline>
+                        </svg>
+                    </button>
                     <button class="icon-btn" onclick="refreshData()" title="Atualizar dados">
                         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                             <polyline points="23 4 23 10 17 10"></polyline>
@@ -79,8 +88,20 @@
                 </div>
             </header>
 
-            <!-- Dashboard Section -->
+            <!-- Dashboard Section (Main Stats) -->
             <section id="section-dashboard" class="content-section active">
+                <!-- Charts -->
+                <div class="charts-grid">
+                    <div class="chart-card large">
+                        <h3>Análise Detalhada - Últimas 24 Horas</h3>
+                        <canvas id="detailed-stats-chart"></canvas>
+                    </div>
+                    <div class="chart-card large">
+                        <h3>Bloqueios Diretos do Servidor - Últimas 24 Horas</h3>
+                        <canvas id="spam-hourly-chart"></canvas>
+                    </div>
+                </div>
+
                 <!-- Stats Cards -->
                 <div class="stats-grid">
                     <div class="stat-card">
@@ -123,25 +144,26 @@
                             <span class="stat-trend" id="memory-used">--</span>
                         </div>
                     </div>
-                </div>
-
-                <!-- Charts -->
-                <div class="charts-grid">
-                    <div class="chart-card">
-                        <h3>Consultas por Hora (Hoje)</h3>
-                        <canvas id="hourly-chart"></canvas>
-                    </div>
-                    <div class="chart-card">
-                        <h3>Distribuição de Resultados</h3>
-                        <canvas id="results-chart"></canvas>
-                    </div>
-                </div>
-
-                <!-- Recent Activity -->
-                <div class="activity-card">
-                    <h3>Atividade Recente</h3>
-                    <div class="activity-list" id="recent-activity">
-                        <p class="loading">Carregando atividades...</p>
+                    <div class="stat-card warning">
+                        <div class="stat-icon">🔒</div>
+                        <div class="stat-info">
+                            <h3>Bloqueios Diretos</h3>
+                            <p class="stat-value" id="spam-total-direct">0</p>
+                            <div style="font-size: 12px; margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(0,0,0,0.1);">
+                                <div style="display: flex; justify-content: space-between; margin: 4px 0;">
+                                    <span>Host:</span>
+                                    <strong id="spam-host-direct">0</strong>
+                                </div>
+                                <div style="display: flex; justify-content: space-between; margin: 4px 0;">
+                                    <span>Domínio:</span>
+                                    <strong id="spam-domain-direct">0</strong>
+                                </div>
+                                <div style="display: flex; justify-content: space-between; margin: 4px 0;">
+                                    <span>IP:</span>
+                                    <strong id="spam-ip-direct">0</strong>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </section>
@@ -156,6 +178,10 @@
                         <option value="BLOCKED">BLOCKED</option>
                         <option value="SOFTFAIL">SOFTFAIL</option>
                         <option value="FAIL">FAIL</option>
+                        <option value="--- SPAM Blocks ---" disabled>--- SPAM Blocks ---</option>
+                        <option value="SPAM_HOST_BLOCKED">🚫 Host Bloqueado (SPAM)</option>
+                        <option value="SPAM_DOMAIN_BLOCKED">🚫 Domínio Bloqueado (SPAM)</option>
+                        <option value="SPAM_IP_BLOCKED">🚫 IP Bloqueado (SPAM)</option>
                     </select>
                 </div>
                 <div class="queries-toolbar">
@@ -306,67 +332,145 @@
                 </div>
             </section>
 
-            <!-- Stats Section -->
-            <section id="section-stats" class="content-section">
-                <div class="chart-card large">
-                    <h3>Análise Detalhada - Últimas 24 Horas</h3>
-                    <canvas id="detailed-stats-chart"></canvas>
-                </div>
-                <div class="stats-summary">
-                    <h3>Resumo Estatístico</h3>
-                    <div id="stats-summary-content">
-                        <p class="loading">Carregando estatísticas...</p>
-                    </div>
-                </div>
-            </section>
 
             <!-- Lists Section (Block & White) -->
             <section id="section-lists" class="content-section">
-                <div class="section-header">
-                    <h2>Gerenciamento de Listas</h2>
+                <!-- Formulários de Adição Manual -->
+                <div class="add-forms-container">
+                    <div class="add-form-card">
+                        <div class="add-form-header">
+                            <span class="add-form-icon">🚫</span>
+                            <h3>Bloquear Manualmente</h3>
+                        </div>
+                        <div class="add-form-body">
+                            <input
+                                type="text"
+                                id="blocklist-add-input"
+                                class="add-form-input"
+                                placeholder="Digite IP, domínio ou email para bloquear"
+                                autocomplete="off"
+                                onkeypress="if(event.key==='Enter') addToBlocklist()"
+                            />
+	                            <button class="btn btn-danger btn-compact" type="button" onclick="addToBlocklist()">
+	                                🚫 Bloquear
+	                            </button>
+                        </div>
+                    </div>
+
+                    <div class="add-form-card">
+                        <div class="add-form-header">
+                            <span class="add-form-icon">✅</span>
+                            <h3>Adicionar à Whitelist</h3>
+                        </div>
+                        <div class="add-form-body">
+                            <input
+                                type="text"
+                                id="whitelist-add-input"
+                                class="add-form-input"
+                                placeholder="Digite IP, domínio ou email"
+                                autocomplete="off"
+                                onkeypress="if(event.key==='Enter') addToWhitelist()"
+                            />
+	                            <button class="btn btn-success btn-compact" type="button" onclick="addToWhitelist()">
+	                                ➕ Adicionar
+	                            </button>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Blacklist -->
                 <div class="list-container">
                     <div class="list-header">
-                        <h3>🚫 Blacklist (Bloqueados)</h3>
-                        <span class="list-count" id="blocklist-count">0 itens</span>
+                        <div>
+                            <h3>🚫 Blacklist (Bloqueados)</h3>
+                            <span class="list-count" id="blocklist-count">0 itens</span>
+                        </div>
+                        <div class="list-toolbar">
+	                            <label class="inline-row">
+	                                <input type="checkbox" id="blocklist-select-all" onchange="toggleSelectAll('block')" />
+	                                Selecionar todos
+	                            </label>
+	                            <div class="list-filter" id="blocklist-filter" role="group" aria-label="Filtrar blacklist">
+	                                <button type="button" class="btn btn-ghost btn-compact filter-pill active" data-type="all" aria-pressed="true">Todos</button>
+	                                <button type="button" class="btn btn-ghost btn-compact filter-pill" data-type="ip" aria-pressed="false">IPs</button>
+	                                <button type="button" class="btn btn-ghost btn-compact filter-pill" data-type="domain" aria-pressed="false">Domínios</button>
+	                                <button type="button" class="btn btn-ghost btn-compact filter-pill" data-type="pair" aria-pressed="false">Campanhas</button>
+	                                <button type="button" class="btn btn-ghost btn-compact filter-pill" data-type="email" aria-pressed="false">Emails</button>
+	                            </div>
+	                            <div class="list-search">
+	                                <input type="text" id="blocklist-search" class="list-search-input" placeholder="Buscar IP, domínio, email ou campanha" autocomplete="off" />
+	                                <button class="btn btn-ghost btn-compact list-search-clear" type="button" id="blocklist-search-clear" onclick="clearBlocklistSearch()" disabled>Limpar</button>
+	                            </div>
+		                            <div class="btn-group">
+		                                <button class="btn btn-primary btn-compact" type="button" onclick="bulkUnblock()">🔓 Desbloquear</button>
+		                                <button class="btn btn-primary btn-compact" type="button" onclick="bulkUnblockAndWhitelist()">✅ Desbloquear + Whitelist</button>
+	                                <button class="btn btn-green btn-compact" type="button" onclick="bulkWhitelist()">✅ Adicionar à Whitelist</button>
+		                            </div>
+                        </div>
                     </div>
                     <div class="table-container">
                         <table class="data-table">
                             <thead>
-                                <tr>
-                                    <th>Token (IP/Domínio/Email)</th>
-                                    <th>Tipo</th>
-                                    <th>Ações</th>
-                                </tr>
+	                                <tr>
+	                                    <th style="width:32px;">#</th>
+	                                    <th>Token (IP/Domínio/Email/Campanha)</th>
+	                                    <th>Tipo</th>
+	                                    <th style="width:180px;">Data/Hora</th>
+	                                </tr>
                             </thead>
                             <tbody id="blocklist-tbody">
-                                <tr><td colspan="3" class="loading">Carregando blacklist...</td></tr>
+                                <tr><td colspan="4" class="loading">Carregando blacklist...</td></tr>
                             </tbody>
                         </table>
+                    </div>
+                    <div class="list-footer">
+                        <div class="list-pagination">
+                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="blocklist-page-prev" onclick="changeListPage('blocklist', -1)" disabled>◀ Anterior</button>
+                            <span class="page-info" id="blocklist-page-info">Página 1/1</span>
+                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="blocklist-page-next" onclick="changeListPage('blocklist', 1)" disabled>Próxima ▶</button>
+                        </div>
+                        <div class="list-status" id="blocklist-status"></div>
                     </div>
                 </div>
 
                 <!-- Whitelist -->
                 <div class="list-container">
                     <div class="list-header">
-                        <h3>✅ Whitelist (Permitidos)</h3>
-                        <span class="list-count" id="whitelist-count">0 itens</span>
+                        <div>
+                            <h3>✅ Whitelist (Permitidos)</h3>
+                            <span class="list-count" id="whitelist-count">0 itens</span>
+                        </div>
+                        <div class="list-toolbar">
+                            <label class="inline-row">
+                                <input type="checkbox" id="whitelist-select-all" onchange="toggleSelectAll('white')" />
+                                Selecionar todos
+                            </label>
+	                            <div class="btn-group">
+	                                <button class="btn btn-danger btn-compact" type="button" onclick="bulkRemoveWhitelist()">🗑️ Remover da Whitelist</button>
+	                            </div>
+                        </div>
                     </div>
                     <div class="table-container">
                         <table class="data-table">
                             <thead>
                                 <tr>
+                                    <th style="width:32px;">#</th>
                                     <th>Token (IP/Domínio/Email)</th>
                                     <th>Tipo</th>
-                                    <th>Ações</th>
                                 </tr>
                             </thead>
                             <tbody id="whitelist-tbody">
                                 <tr><td colspan="3" class="loading">Carregando whitelist...</td></tr>
                             </tbody>
                         </table>
+                    </div>
+                    <div class="list-footer">
+                        <div class="list-pagination">
+                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="whitelist-page-prev" onclick="changeListPage('whitelist', -1)" disabled>◀ Anterior</button>
+                            <span class="page-info" id="whitelist-page-info">Página 1/1</span>
+                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="whitelist-page-next" onclick="changeListPage('whitelist', 1)" disabled>Próxima ▶</button>
+                        </div>
+                        <div class="list-status" id="whitelist-status"></div>
                     </div>
                 </div>
             </section>
@@ -404,6 +508,228 @@
                         </div>
                         <div class="logs-container">
                             <pre id="logs-users-content" class="logs-content"><span class="loading">Carregando logs de usuários...</span></pre>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Subdomain Campaign Blocker Section -->
+            <section id="section-subdomain-campaign" class="content-section">
+                <div class="addon-header">
+                    <div class="addon-header-info">
+                        <h3>🎯 Bloqueador de Campanhas de Spam por Subdomínios</h3>
+                        <p class="muted">Detecta e bloqueia automaticamente campanhas de spam que usam múltiplos subdomínios do mesmo domínio base com padrões numéricos.</p>
+                        <div class="addon-pill-row">
+                            <span class="addon-pill">Detecção de Padrões</span>
+                            <span class="addon-pill">Multi-Critério</span>
+                            <span class="addon-pill">Wildcard Blocking</span>
+                        </div>
+                    </div>
+                    <div class="addon-header-actions">
+                        <button class="btn btn-primary btn-compact" type="button" onclick="saveSubdomainCampaignConfig()">💾 Salvar configuração</button>
+                        <button id="subdomain-campaign-scan-button" class="btn btn-primary btn-compact" type="button" onclick="runSubdomainCampaignScan(true)">▶️ Executar análise</button>
+                    </div>
+                </div>
+
+                <!-- Status Card -->
+                <div class="addon-card addon-status-card-full">
+                    <div class="addon-card-header">
+                        <span class="addon-card-title">📊 Status do Sistema</span>
+                    </div>
+                    <p id="subdomain-campaign-status" class="addon-status-text">Carregando configuração...</p>
+                </div>
+
+                <!-- Abas de Navegação -->
+                <div class="addon-tabs">
+                    <button class="addon-tab-btn active" onclick="switchSubdomainCampaignTab('report', event)">📊 Campanhas Detectadas</button>
+                    <button class="addon-tab-btn" onclick="switchSubdomainCampaignTab('autoblock', event)">🚨 Bloqueio Automático</button>
+                    <button class="addon-tab-btn" onclick="switchSubdomainCampaignTab('config', event)">⚙️ Configuração</button>
+                </div>
+
+                <!-- Aba: Campanhas Detectadas -->
+                <div id="subdomain-campaign-tab-report" class="addon-tab-content active">
+                    <div class="addon-tab-grid">
+                        <div class="addon-card addon-card-full">
+                            <div class="addon-card-header">
+                                <span class="addon-card-title">🎯 Campanhas de Alto Risco</span>
+                                <button class="btn btn-ghost btn-sm" type="button" onclick="toggleSubdomainCampaignDetails()">
+                                    <span id="subdomain-campaign-toggle-icon">▼</span> Detalhes
+                                </button>
+                            </div>
+                            <div id="subdomain-campaign-summary" class="addon-summary"></div>
+                            <div id="subdomain-campaign-details" class="addon-report-details" style="display: none;">
+                                <div class="addon-card-header" style="margin-top: 1rem;">
+                                    <span class="addon-card-title">🔍 Detalhamento Completo das Campanhas</span>
+                                </div>
+                                <textarea id="subdomain-campaign-results" class="addon-results-textarea" readonly rows="15" placeholder="Execute uma análise para ver as campanhas detectadas..."></textarea>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Aba: Bloqueio Automático -->
+                <div id="subdomain-campaign-tab-autoblock" class="addon-tab-content">
+                    <div class="addon-tab-grid">
+                        <!-- Card 1: Automação Principal -->
+                        <div class="addon-card addon-card-full">
+                            <div class="addon-card-header">
+                                <span class="addon-card-title">🤖 Configuração de Automação</span>
+                            </div>
+                            <div class="addon-form-stack">
+                                <label class="inline-row checkbox-large">
+                                    <input type="checkbox" id="subdomain-campaign-enabled" />
+                                    <span><strong>Habilitar Detector de Campanhas</strong></span>
+                                </label>
+                                <p class="section-help">🔍 Ativa a varredura contínua em busca de campanhas de spam por subdomínios.</p>
+
+                                <label class="inline-row checkbox-large">
+                                    <input type="checkbox" id="subdomain-campaign-auto-block" />
+                                    <span><strong>Ativar Bloqueio Automático</strong></span>
+                                </label>
+                                <p class="section-help">⚡ Quando ativado, bloqueia automaticamente domínios base (wildcard) de campanhas detectadas.</p>
+
+                                <label class="inline-row">
+                                    <input type="checkbox" id="subdomain-campaign-dry-run" />
+                                    <span><strong>Modo Simulação (Dry Run)</strong></span>
+                                </label>
+                                <p class="section-help">🧪 Apenas simula bloqueios sem executá-los. Recomendado para testes iniciais.</p>
+                            </div>
+                        </div>
+
+                        <!-- Card 2: Risk Scoring -->
+                        <div class="addon-card addon-card-full">
+                            <div class="addon-card-header">
+                                <span class="addon-card-title">🎯 Sistema de Pontuação de Risco</span>
+                            </div>
+                            <div class="addon-form-stack">
+                                <div class="addon-slider-block">
+                                    <div class="addon-slider-header">
+                                        <label for="subdomain-campaign-risk-threshold">Limiar de Bloqueio (Risk Score 0-100)</label>
+                                        <span id="subdomain-campaign-risk-threshold-value" class="addon-slider-value">70</span>
+                                    </div>
+                                    <input type="range" id="subdomain-campaign-risk-threshold" min="30" max="100" step="5" value="70" class="slider">
+                                    <div class="addon-slider-meta">
+                                        <span>Mais Agressivo</span>
+                                        <span>Mais Conservador</span>
+                                    </div>
+                                    <p class="section-help">💡 <strong>Recomendado: 70</strong> (balanceado) • 80 (conservador) • 60 (agressivo)</p>
+                                </div>
+                                <div class="addon-info-box">
+                                    <strong>🧮 Critérios de Pontuação:</strong>
+                                    <ul style="margin: 0.5rem 0 0 1.2rem; font-size: 0.9em;">
+                                        <li><strong>Padrão Numérico</strong> (0-35 pts) - Subdomínios com números (ex: doc123)</li>
+                                        <li><strong>Quantidade de Subdomínios</strong> (0-25 pts) - Múltiplos subdomínios</li>
+                                        <li><strong>Taxa PASS</strong> (0-20 pts) - Spam passando SPF</li>
+                                        <li><strong>Velocidade</strong> (0-15 pts) - Eventos por hora</li>
+                                        <li><strong>Botnet</strong> (0-10 pts) - Múltiplos IPs diferentes</li>
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Card 3: Ação de Bloqueio -->
+                        <div class="addon-card addon-card-full">
+                            <div class="addon-card-header">
+                                <span class="addon-card-title">🛡️ Tipo de Bloqueio</span>
+                            </div>
+                            <div class="addon-form-stack">
+                                <label class="inline-row">
+                                    <input type="radio" name="block-action" id="subdomain-campaign-block-action-block" value="block" />
+                                    <span><strong>Block</strong> - Bloqueia domínio com wildcard (.dominio.com)</span>
+                                </label>
+                                <label class="inline-row">
+                                    <input type="radio" name="block-action" id="subdomain-campaign-block-action-superblock" value="superblock" checked />
+                                    <span><strong>Superblock</strong> - Bloqueio mais restritivo (recomendado)</span>
+                                </label>
+                                <p class="section-help">⚠️ Superblock é mais agressivo e bloqueia de forma mais abrangente. Use para campanhas persistentes.</p>
+                            </div>
+                        </div>
+
+                        <!-- Card 4: Log de Ações -->
+                        <div class="addon-card addon-card-full">
+                            <div class="addon-card-header">
+                                <span class="addon-card-title">📋 Histórico de Bloqueios</span>
+                            </div>
+                            <textarea id="subdomain-campaign-actions" class="addon-actions-log-textarea" readonly rows="10" placeholder="Nenhuma ação executada ainda. Os bloqueios aparecerão aqui..."></textarea>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Aba: Configuração -->
+                <div id="subdomain-campaign-tab-config" class="addon-tab-content">
+                    <div class="addon-tab-grid">
+                        <!-- Card 1: Parâmetros de Detecção -->
+                        <div class="addon-card addon-card-full">
+                            <div class="addon-card-header">
+                                <span class="addon-card-title">🔍 Parâmetros de Detecção</span>
+                            </div>
+                            <div class="addon-form-grid">
+                                <div class="addon-form-field">
+                                    <label for="subdomain-campaign-window">📅 Janela de Análise (horas)</label>
+                                    <input type="number" id="subdomain-campaign-window" min="1" max="72" class="search-input" value="6">
+                                    <small class="field-hint">Padrão: 6h (detecção rápida de ataques)</small>
+                                </div>
+                                <div class="addon-form-field">
+                                    <label for="subdomain-campaign-min-subdomains">🎯 Mínimo de Subdomínios</label>
+                                    <input type="number" id="subdomain-campaign-min-subdomains" min="2" max="20" class="search-input" value="3">
+                                    <small class="field-hint">Mínimo de subdomínios para considerar campanha</small>
+                                </div>
+                                <div class="addon-form-field">
+                                    <label for="subdomain-campaign-min-events">🔢 Mínimo de Eventos</label>
+                                    <input type="number" id="subdomain-campaign-min-events" min="5" max="1000" class="search-input" value="10">
+                                    <small class="field-hint">Eventos mínimos por domínio base</small>
+                                </div>
+                                <div class="addon-form-field">
+                                    <label for="subdomain-campaign-poll">⏱️ Intervalo de Scan (segundos)</label>
+                                    <input type="number" id="subdomain-campaign-poll" min="30" max="3600" class="search-input" value="60">
+                                    <small class="field-hint">Frequência da varredura automática</small>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Card 2: Whitelist -->
+                        <div class="addon-card addon-card-full">
+                            <div class="addon-card-header">
+                                <span class="addon-card-title">🛡️ Whitelist (Domínios Protegidos)</span>
+                            </div>
+                            <div class="addon-form-stack">
+                                <label for="subdomain-campaign-whitelist">Domínios que nunca serão bloqueados</label>
+                                <textarea id="subdomain-campaign-whitelist" class="search-input" rows="4" placeholder="Ex.: cliente-importante.com&#10;parceiro.com.br&#10;dominio-confiavel.net&#10;(um por linha ou separado por vírgula)"></textarea>
+                                <p class="section-help">🛡️ Domínios listados aqui serão ignorados pelo detector, mesmo que apresentem padrões suspeitos.</p>
+                                <div class="addon-info-box">
+                                    <strong>ℹ️ Whitelist Automática:</strong>
+                                    <p style="margin: 0.3rem 0 0 0; font-size: 0.9em;">
+                                        O sistema já ignora automaticamente serviços conhecidos como sendgrid.net, amazonses.com, mailgun.org, hubspotemail.net, e outros.
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Card 3: Exemplos de Detecção -->
+                        <div class="addon-card addon-card-full">
+                            <div class="addon-card-header">
+                                <span class="addon-card-title">📚 Exemplos de Campanhas Detectadas</span>
+                            </div>
+                            <div class="addon-info-box">
+                                <strong>🎯 Padrões Típicos de Spam:</strong>
+                                <div style="margin-top: 0.5rem; font-family: monospace; font-size: 0.85em;">
+                                    <div style="margin-bottom: 0.5rem;">
+                                        <strong>Campanha "pagarfacil":</strong><br>
+                                        → docfiscal160.pagarfacilbrasil.com<br>
+                                        → docfiscal183.pagarfacilgo.com<br>
+                                        → docfiscal137.pagarfacilaqui.com
+                                    </div>
+                                    <div>
+                                        <strong>Campanha "frutagostosa":</strong><br>
+                                        → relatorios05e.acaisolteirofrutagostosa.sbs<br>
+                                        → relatorios10j.abiufrutagostosa.sbs<br>
+                                        → relatorios13m.acaifrutagostosa.sbs
+                                    </div>
+                                </div>
+                                <p style="margin: 0.8rem 0 0 0; font-size: 0.9em;">
+                                    ✅ <strong>Características comuns:</strong> Prefixo comum + número + domínio base variável
+                                </p>
+                            </div>
                         </div>
                     </div>
                 </div>

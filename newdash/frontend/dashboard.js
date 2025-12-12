@@ -21,11 +21,37 @@ const MOON_ICON = `
   <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"></path>
 </svg>`;
 
+const SMTP_ICON_ON = `
+<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <rect x="3" y="5" width="18" height="14" rx="2" ry="2"></rect>
+  <polyline points="3 7 12 13 21 7"></polyline>
+</svg>`;
+
+const SMTP_ICON_OFF = `
+<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <rect x="3" y="5" width="18" height="14" rx="2" ry="2"></rect>
+  <polyline points="3 7 12 13 21 7"></polyline>
+  <line x1="4" y1="20" x2="20" y2="4"></line>
+</svg>`;
+
 // Global state
 let charts = {};
+let currentUserContext = null;
+let smtpEnabled = null;
 let queries = [];
 let refreshTimer;
 let selectedQueryId = null;
+let blocklistData = [];
+let whitelistData = [];
+const LIST_PAGE_SIZE = 20;
+const blocklistPagination = { page: 1, totalPages: 1, total: 0, pageSize: LIST_PAGE_SIZE };
+const whitelistPagination = { page: 1, totalPages: 1, total: 0, pageSize: LIST_PAGE_SIZE };
+let blocklistSearchTerm = '';
+let blocklistSearchTimer = null;
+const BLOCKLIST_SEARCH_DELAY = 300;
+let blocklistTypeFilter = 'all';
+const ALLOWED_BLOCKLIST_TYPES = new Set(['all', 'ip', 'domain', 'email', 'pair']);
+const ADMIN_ONLY_SECTIONS = new Set(['servers', 'users', 'logs', 'subdomain-campaign', 'settings']);
 
 const HTML_ESCAPE_MAP = {
     '&': '&amp;',
@@ -79,6 +105,29 @@ function normalizeQuery(rawQuery, index) {
 
 function normalizeQueries(rawQueries) {
     return (rawQueries || []).map((query, index) => normalizeQuery(query, index));
+}
+
+function getSafePageSize(size) {
+    return (typeof size === 'number' && size > 0) ? size : LIST_PAGE_SIZE;
+}
+
+function calculateTotalPages(total, pageSize) {
+    if (!total) {
+        return 1;
+    }
+    const safeSize = getSafePageSize(pageSize);
+    return Math.max(1, Math.ceil(total / safeSize));
+}
+
+function formatListRange(page, pageSize, total) {
+    if (!total) {
+        return 'Nenhum item';
+    }
+    const safeSize = getSafePageSize(pageSize);
+    const safePage = Math.max(1, page || 1);
+    const start = ((safePage - 1) * safeSize) + 1;
+    const end = Math.min(total, start + safeSize - 1);
+    return `${start}-${end} de ${total}`;
 }
 
 // Parse timestamp safely with timezone support
@@ -223,22 +272,188 @@ function renderThemeIcon() {
     icon.innerHTML = isDark ? SUN_ICON : MOON_ICON;
 }
 
+function isAdminUser() {
+    return currentUserContext?.is_admin === true;
+}
+
+function updateSmtpToggleButton() {
+    const btn = document.getElementById('smtp-toggle');
+    if (!btn) {
+        return;
+    }
+    const enabled = smtpEnabled !== false;
+    btn.classList.toggle('smtp-disabled', !enabled);
+    btn.innerHTML = enabled ? SMTP_ICON_ON : SMTP_ICON_OFF;
+    btn.title = enabled
+        ? 'Envio de e-mails do SPFBL está ATIVO. Clique para desativar.'
+        : 'Envio de e-mails do SPFBL está DESATIVADO. Clique para ativar.';
+}
+
+async function loadSmtpStatus() {
+    if (!isAdminUser()) {
+        return;
+    }
+    try {
+        const response = await fetch(`${API_URL}/settings/smtp-status`, { credentials: 'include' });
+        if (!response.ok) {
+            return;
+        }
+        const data = await response.json();
+        smtpEnabled = data.enabled === true;
+        updateSmtpToggleButton();
+    } catch (error) {
+        console.warn('Unable to load SMTP status:', error);
+    }
+}
+
+async function toggleSmtpNotifications() {
+    if (!isAdminUser()) {
+        showNotification('Acesso restrito ao administrador.', 'warning', 3000);
+        return;
+    }
+    if (smtpEnabled === null) {
+        await loadSmtpStatus();
+        if (smtpEnabled === null) {
+            showNotification('Não foi possível verificar o estado do SMTP.', 'error', 3500);
+            return;
+        }
+    }
+
+    const desiredEnabled = !smtpEnabled;
+    const btn = document.getElementById('smtp-toggle');
+    if (btn) {
+        btn.disabled = true;
+    }
+
+    try {
+        const response = await fetch(`${API_URL}/settings/smtp-toggle`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ enabled: desiredEnabled })
+        });
+        const data = await response.json();
+        if (response.ok && data.success) {
+            smtpEnabled = data.enabled === true;
+            updateSmtpToggleButton();
+            showNotification(
+                smtpEnabled
+                    ? 'Envio de e-mails ativado.'
+                    : 'Envio de e-mails desativado (abuse/TOTP).',
+                'success',
+                3500
+            );
+            if (data.service_restarted === false) {
+                showNotification('Configuração salva, mas SPFBL não reiniciou automaticamente.', 'warning', 4500);
+            }
+        } else {
+            showNotification(data.error || 'Falha ao alterar envio de e-mails.', 'error', 4000);
+        }
+    } catch (error) {
+        showNotification('Erro ao conectar para alterar SMTP.', 'error', 4000);
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+        }
+    }
+}
+
+async function loadCurrentUserContext() {
+    try {
+        const response = await fetch(`${API_URL}/user`, { credentials: 'include' });
+        if (response.ok) {
+            currentUserContext = await response.json();
+        }
+    } catch (error) {
+        console.warn('Unable to load user context:', error);
+    }
+    return currentUserContext;
+}
+
+function applyRoleVisibility() {
+    if (!currentUserContext || isAdminUser()) {
+        return;
+    }
+
+    const adminNavSelectors = [
+        '.nav-item[href="#servers"]',
+        '.nav-item[href="#users"]',
+        '.nav-item[href="/settings"]',
+        '.nav-item[href="#logs"]',
+        '.nav-item[href="#subdomain-campaign"]'
+    ];
+
+    adminNavSelectors.forEach(selector => {
+        document.querySelectorAll(selector).forEach(el => el.classList.add('is-hidden'));
+    });
+
+    const adminSectionIds = [
+        'section-servers',
+        'section-users',
+        'section-logs',
+        'section-subdomain-campaign'
+    ];
+
+    adminSectionIds.forEach(id => {
+        document.getElementById(id)?.classList.add('is-hidden');
+    });
+
+    const memoryCard = document.getElementById('memory-percent')?.closest('.stat-card');
+    memoryCard?.classList.add('is-hidden');
+
+    document.getElementById('smtp-toggle')?.classList.add('is-hidden');
+
+    document.querySelector('.add-forms-container')?.classList.add('is-hidden');
+    document.getElementById('blocklist-select-all')?.closest('label')?.classList.add('is-hidden');
+    document.getElementById('whitelist-select-all')?.closest('label')?.classList.add('is-hidden');
+    document.querySelectorAll('#section-lists .list-toolbar .btn-group').forEach(group => group.classList.add('is-hidden'));
+
+    ['#action-block-ip', '#action-whitelist-ip', '#action-block-sender'].forEach(selector => {
+        document.querySelector(selector)?.classList.add('is-hidden');
+    });
+    document.querySelector('.selected-button-group.global')?.classList.add('is-hidden');
+
+    const activeNav = document.querySelector('.nav-item.active');
+    if (activeNav?.classList.contains('is-hidden')) {
+        document.querySelector('.nav-item[href="#dashboard"]')?.classList.add('active');
+        document.getElementById('section-dashboard')?.classList.add('active');
+        document.getElementById('page-title').textContent = 'Dashboard';
+    }
+}
+
 // Initialize dashboard
 document.addEventListener('DOMContentLoaded', () => {
     initializeSidebar();
     restoreTheme();
     renderThemeIcon();
-    initCharts();
-    loadDashboardData();
-    startAutoRefresh();
-    setupFilters();
-    setupServerSelection();
+
+    (async () => {
+        await loadCurrentUserContext();
+        applyRoleVisibility();
+        updateSmtpToggleButton();
+        await loadSmtpStatus();
+        initCharts();
+        loadDashboardData();
+        loadDetailedStats();
+        loadSpamBlockStats();
+        startAutoRefresh();
+        setupFilters();
+        setupServerSelection();
+        setupBlocklistSearch();
+        setupBlocklistTypeFilter();
+    })();
 });
 
 // Navigation
 function showSection(sectionName, navEvent) {
     if (navEvent && typeof navEvent.preventDefault === 'function') {
         navEvent.preventDefault();
+    }
+
+    if (!isAdminUser() && ADMIN_ONLY_SECTIONS.has(sectionName)) {
+        showNotification('Acesso restrito ao administrador.', 'warning', 3000);
+        sectionName = 'dashboard';
+        navEvent = null;
     }
 
     const navItems = document.querySelectorAll('.nav-item');
@@ -273,51 +488,60 @@ function showSection(sectionName, navEvent) {
         queries: 'Consultas Recentes',
         servers: 'Servidores Conectados',
         users: 'Usuários do Sistema',
-        stats: 'Estatísticas Detalhadas',
         lists: 'Listas de Bloqueio e Whitelist',
         settings: 'Configurações',
-        logs: 'Logs do SPFBL'
+        logs: 'Logs do SPFBL',
+        'subdomain-campaign': 'Campanhas de Spam'
     };
     document.getElementById('page-title').textContent = titles[sectionName] || 'Dashboard';
 
     // Load section data
-    if (sectionName === 'queries') {
+    if (sectionName === 'dashboard') {
+        loadDashboardData();
+        loadSpamBlockStats();
+    } else if (sectionName === 'queries') {
         loadQueries();
     } else if (sectionName === 'servers') {
         loadServers();
     } else if (sectionName === 'users') {
         loadUsers();
-    } else if (sectionName === 'stats') {
-        loadDetailedStats();
     } else if (sectionName === 'lists') {
         loadLists();
     } else if (sectionName === 'logs') {
         loadLogs();
+    } else if (sectionName === 'subdomain-campaign') {
+        loadSubdomainCampaignConfig();
     }
 }
 
 // Initialize Charts
 function initCharts() {
-    // Hourly Chart
-    const hourlyCtx = document.getElementById('hourly-chart').getContext('2d');
-    charts.hourly = new Chart(hourlyCtx, {
-        type: 'line',
+    // Detailed Stats Chart
+    const detailedCtx = document.getElementById('detailed-stats-chart').getContext('2d');
+    charts.detailed = new Chart(detailedCtx, {
+        type: 'bar',
         data: {
             labels: [],
             datasets: [
                 {
-                    label: 'Total',
+                    label: 'PASS',
                     data: [],
-                    borderColor: '#2563eb',
-                    backgroundColor: 'rgba(37, 99, 235, 0.1)',
-                    tension: 0.4
+                    backgroundColor: '#10b981'
                 },
                 {
-                    label: 'Bloqueados',
+                    label: 'BLOCKED',
                     data: [],
-                    borderColor: '#ef4444',
-                    backgroundColor: 'rgba(239, 68, 68, 0.1)',
-                    tension: 0.4
+                    backgroundColor: '#ef4444'
+                },
+                {
+                    label: 'SOFTFAIL',
+                    data: [],
+                    backgroundColor: '#f59e0b'
+                },
+                {
+                    label: 'FAIL',
+                    data: [],
+                    backgroundColor: '#dc2626'
                 }
             ]
         },
@@ -330,28 +554,56 @@ function initCharts() {
                 }
             },
             scales: {
+                x: {
+                    stacked: true
+                },
                 y: {
+                    stacked: true,
                     beginAtZero: true
+                }
+            },
+            animation: {
+                duration: 800,
+                easing: 'easeOutQuart'
+            },
+            animations: {
+                y: {
+                    type: 'number',
+                    easing: 'easeOutQuart',
+                    duration: 800,
+                    from: 0
+                },
+                x: {
+                    type: 'number',
+                    duration: 0
                 }
             }
         }
     });
 
-    // Results Pie Chart
-    const resultsCtx = document.getElementById('results-chart').getContext('2d');
-    charts.results = new Chart(resultsCtx, {
-        type: 'doughnut',
+    // SPAM Hourly Chart
+    const spamHourlyCtx = document.getElementById('spam-hourly-chart').getContext('2d');
+    charts.spamHourly = new Chart(spamHourlyCtx, {
+        type: 'bar',
         data: {
-            labels: ['PASS', 'BLOCKED', 'SOFTFAIL', 'FAIL'],
-            datasets: [{
-                data: [0, 0, 0, 0],
-                backgroundColor: [
-                    '#10b981',
-                    '#ef4444',
-                    '#f59e0b',
-                    '#dc2626'
-                ]
-            }]
+            labels: [],
+            datasets: [
+                {
+                    label: 'Host Bloqueado',
+                    data: [],
+                    backgroundColor: '#3b82f6'
+                },
+                {
+                    label: 'Domínio Bloqueado',
+                    data: [],
+                    backgroundColor: '#f59e0b'
+                },
+                {
+                    label: 'IP Bloqueado',
+                    data: [],
+                    backgroundColor: '#ef4444'
+                }
+            ]
         },
         options: {
             responsive: true,
@@ -359,6 +611,31 @@ function initCharts() {
             plugins: {
                 legend: {
                     position: 'bottom'
+                }
+            },
+            scales: {
+                x: {
+                    stacked: true
+                },
+                y: {
+                    stacked: true,
+                    beginAtZero: true
+                }
+            },
+            animation: {
+                duration: 800,
+                easing: 'easeOutQuart'
+            },
+            animations: {
+                y: {
+                    type: 'number',
+                    easing: 'easeOutQuart',
+                    duration: 800,
+                    from: 0
+                },
+                x: {
+                    type: 'number',
+                    duration: 0
                 }
             }
         }
@@ -378,20 +655,22 @@ async function loadDashboardData() {
         const hourlyResponse = await fetch(`${API_URL}/queries/today`);
         const hourlyData = await hourlyResponse.json();
 
-        updateHourlyChart(hourlyData);
-        updateResultsChart(stats);
+        updateDetailedChart(hourlyData);
 
-        // Load recent activity
-        const queriesResponse = await fetch(`${API_URL}/queries`);
-        const queriesData = await queriesResponse.json();
+        // Load SPAM blocks by hour
+        const spamHourlyResponse = await fetch(`${API_URL}/stats/spam-blocks/hourly`);
+        if (spamHourlyResponse.ok) {
+            const spamHourlyData = await spamHourlyResponse.json();
+            updateSpamHourlyChart(spamHourlyData);
+            checkSpamBlockAlerts(spamHourlyData);
+        }
 
-        updateRecentActivity(queriesData.queries.slice(0, 10));
-
-        // Load server memory
-        const memoryResponse = await fetch(`${API_URL}/server/memory`);
-        const memoryData = await memoryResponse.json();
-
-        updateMemoryCard(memoryData);
+        // Load server memory (admin only)
+        if (isAdminUser()) {
+            const memoryResponse = await fetch(`${API_URL}/server/memory`);
+            const memoryData = await memoryResponse.json();
+            updateMemoryCard(memoryData);
+        }
 
         // Update uptime
         if (stats.uptime) {
@@ -437,6 +716,98 @@ function updateMemoryCard(memoryData) {
 
     document.getElementById('memory-percent').textContent = `${percent}%`;
     document.getElementById('memory-used').textContent = `${usedGB}GB / ${totalGB}GB`;
+}
+
+// Update SPAM Blocks Summary
+function updateSpamBlocksCard(spamData) {
+    if (!spamData || !spamData.success) {
+        document.getElementById('spam-total-direct').textContent = '0';
+        document.getElementById('spam-host-direct').textContent = '0';
+        document.getElementById('spam-domain-direct').textContent = '0';
+        document.getElementById('spam-ip-direct').textContent = '0';
+        return;
+    }
+
+    const hostBlocked = spamData.host_blocked || 0;
+    const domainBlocked = spamData.domain_blocked || 0;
+    const ipBlocked = spamData.ip_blocked || 0;
+    const totalBlocked = ipBlocked; // total de eventos na janela
+
+    document.getElementById('spam-total-direct').textContent = totalBlocked.toLocaleString('pt-BR');
+    document.getElementById('spam-host-direct').textContent = hostBlocked.toLocaleString('pt-BR');
+    document.getElementById('spam-domain-direct').textContent = domainBlocked.toLocaleString('pt-BR');
+    document.getElementById('spam-ip-direct').textContent = ipBlocked.toLocaleString('pt-BR');
+}
+
+// Update SPAM Hourly Chart
+function updateSpamHourlyChart(spamHourlyData) {
+    if (!spamHourlyData || !charts.spamHourly) return;
+
+    const labels = spamHourlyData.labels && spamHourlyData.labels.length
+        ? spamHourlyData.labels
+        : (spamHourlyData.hours || []).map(h => `${h}:00`);
+
+    charts.spamHourly.data.labels = labels;
+    charts.spamHourly.data.datasets[0].data = spamHourlyData.host_blocked || [];
+    charts.spamHourly.data.datasets[1].data = spamHourlyData.domain_blocked || [];
+    charts.spamHourly.data.datasets[2].data = spamHourlyData.ip_blocked || [];
+    charts.spamHourly.update();
+}
+
+// Check SPAM Block Alerts
+function checkSpamBlockAlerts(spamHourlyData) {
+    if (!spamHourlyData) return;
+
+    const ALERT_THRESHOLD = 50;
+    const lastIndex = (spamHourlyData.host_blocked || []).length - 1;
+    const currentHour = lastIndex >= 0 ? lastIndex : 0;
+    const currentHourData = {
+        host: spamHourlyData.host_blocked[currentHour] || 0,
+        domain: spamHourlyData.domain_blocked[currentHour] || 0,
+        ip: spamHourlyData.ip_blocked[currentHour] || 0
+    };
+
+    const totalCurrentHour = currentHourData.host + currentHourData.domain + currentHourData.ip;
+
+    if (totalCurrentHour > ALERT_THRESHOLD) {
+        triggerSpamAlert(totalCurrentHour, currentHourData);
+    }
+
+    // ML: Detect anomalous patterns
+    detectSpamAnomalies(spamHourlyData);
+}
+
+// Trigger SPAM Alert (Disabled)
+function triggerSpamAlert(totalBlocks, breakdown) {
+    // Alerta desabilitado
+}
+
+// Detect SPAM Anomalies (ML Pattern Detection)
+function detectSpamAnomalies(spamHourlyData) {
+    if (!spamHourlyData.host_blocked || spamHourlyData.host_blocked.length === 0) return;
+
+    const allHours = spamHourlyData.host_blocked.map((h, i) => ({
+        hour: i,
+        host: h || 0,
+        domain: (spamHourlyData.domain_blocked[i] || 0),
+        ip: (spamHourlyData.ip_blocked[i] || 0)
+    }));
+
+    const totalPerHour = allHours.map(h => h.host + h.domain + h.ip);
+    const avgBlocks = totalPerHour.reduce((a, b) => a + b, 0) / totalPerHour.length;
+    const stdDev = Math.sqrt(
+        totalPerHour.reduce((sq, n) => sq + Math.pow(n - avgBlocks, 2), 0) / totalPerHour.length
+    );
+
+    const anomalies = totalPerHour.map((total, hour) => {
+        const zScore = (total - avgBlocks) / (stdDev || 1);
+        return { hour, total, zScore, isAnomaly: Math.abs(zScore) > 2 };
+    }).filter(a => a.isAnomaly);
+
+    if (anomalies.length > 0) {
+        console.warn('🤖 Anomalias SPAM detectadas:', anomalies.map(a => `${a.hour}:00 (${a.total} bloqueios, zscore: ${a.zScore.toFixed(2)})`).join(', '));
+        localStorage.setItem('spam_anomalies_' + new Date().toISOString().split('T')[0], JSON.stringify(anomalies));
+    }
 }
 
 // Update Uptime Info
@@ -485,23 +856,29 @@ function parseUptimeString(uptimeStr) {
     }
 }
 
-// Update Hourly Chart
-function updateHourlyChart(data) {
-    charts.hourly.data.labels = data.hours.map(h => `${h}:00`);
-    charts.hourly.data.datasets[0].data = data.total;
-    charts.hourly.data.datasets[1].data = data.blocked;
-    charts.hourly.update();
+// Update Detailed Stats Chart
+function updateDetailedChart(data) {
+    charts.detailed.data.labels = data.hours.map(h => `${h}:00`);
+    charts.detailed.data.datasets[0].data = data.passed;
+    charts.detailed.data.datasets[1].data = data.blocked;
+    charts.detailed.data.datasets[2].data = data.softfail;
+    charts.detailed.data.datasets[3].data = data.failed;
+    charts.detailed.update();
 }
 
-// Update Results Chart
-function updateResultsChart(stats) {
-    charts.results.data.datasets[0].data = [
-        stats.passed || 0,
-        stats.blocked || 0,
-        stats.softfail || 0,
-        stats.failed || 0
-    ];
-    charts.results.update();
+// SPAM Block Statistics
+async function loadSpamBlockStats() {
+    try {
+        const response = await fetch(`${API_URL}/stats/spam-blocks`, {credentials: 'include'});
+        if (response.ok) {
+            const data = await response.json();
+            if (data.success) {
+                updateSpamBlocksCard(data);
+            }
+        }
+    } catch (error) {
+        console.error('Error loading SPAM block stats:', error);
+    }
 }
 
 // Update Recent Activity
@@ -999,12 +1376,32 @@ function applyFilters() {
         );
     }
 
-    // Apply result filter
+    // Apply result filter with SPAM block types
     if (filterResult) {
-        filtered = filtered.filter(q => q.result === filterResult);
+        if (filterResult.startsWith('SPAM_')) {
+            filtered = filtered.filter(q => {
+                const spamType = extractSpamBlockType(q.reason || q.result);
+                if (filterResult === 'SPAM_HOST_BLOCKED') return spamType === 'HOST_BLOCKED';
+                if (filterResult === 'SPAM_DOMAIN_BLOCKED') return spamType === 'DOMAIN_BLOCKED';
+                if (filterResult === 'SPAM_IP_BLOCKED') return spamType === 'IP_BLOCKED';
+                return false;
+            });
+        } else {
+            filtered = filtered.filter(q => q.result === filterResult);
+        }
     }
 
     displayQueries(filtered);
+}
+
+// Extract SPAM block type from reason or result
+function extractSpamBlockType(text) {
+    if (!text) return null;
+    const textStr = String(text);
+    if (textStr.includes('Host Blocked')) return 'HOST_BLOCKED';
+    if (textStr.includes('Domain Blocked')) return 'DOMAIN_BLOCKED';
+    if (textStr.includes('IP Blocked')) return 'IP_BLOCKED';
+    return null;
 }
 
 // Auto Refresh
@@ -1014,12 +1411,17 @@ function startAutoRefresh() {
 
         if (activeSection === 'dashboard') {
             loadDashboardData();
+            loadSpamBlockStats();
         } else if (activeSection === 'queries') {
             loadQueries();
-        } else if (activeSection === 'clients') {
-            loadClients();
-        } else if (activeSection === 'stats') {
-            loadDetailedStats();
+        } else if (activeSection === 'lists') {
+            loadLists();
+        } else if (activeSection === 'servers') {
+            loadServers();
+        } else if (activeSection === 'users') {
+            loadUsers();
+        } else if (activeSection === 'logs') {
+            loadLogs();
         }
 
         // Atualizar horário em todas as seções
@@ -1030,14 +1432,25 @@ function startAutoRefresh() {
 function refreshData() {
     const activeSection = document.querySelector('.content-section.active').id.replace('section-', '');
 
+    if (!isAdminUser() && ADMIN_ONLY_SECTIONS.has(activeSection)) {
+        showNotification('Acesso restrito ao administrador.', 'warning', 3000);
+        showSection('dashboard');
+        return;
+    }
+
     if (activeSection === 'dashboard') {
         loadDashboardData();
+        loadSpamBlockStats();
     } else if (activeSection === 'queries') {
         loadQueries();
+    } else if (activeSection === 'lists') {
+        loadLists();
     } else if (activeSection === 'servers') {
         loadServers();
-    } else if (activeSection === 'stats') {
-        loadDetailedStats();
+    } else if (activeSection === 'users') {
+        loadUsers();
+    } else if (activeSection === 'logs') {
+        loadLogs();
     }
 
     // Atualizar horário ao fazer refresh manual
@@ -1045,20 +1458,6 @@ function refreshData() {
 }
 
 // Utility Functions
-function formatTimestamp(timestamp) {
-    const date = parseTimestampSafely(timestamp);
-
-    if (!date) {
-        return '--:--:--';
-    }
-
-    return date.toLocaleString('pt-BR', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
-    });
-}
-
 function updateLastUpdateTime() {
     const now = new Date();
     document.getElementById('last-update').textContent = now.toLocaleTimeString('pt-BR');
@@ -1335,13 +1734,14 @@ async function handleUnblockToken() {
         const data = await response.json();
 
         if (response.ok && data.success) {
-            alert(`✅ ${data.message}`);
+            showNotification(data.message, 'success');
+            await loadLists();
         } else {
-            alert(`❌ ${data.error || 'Erro ao desbloquear'}`);
+            showNotification(data.error || 'Erro ao desbloquear', 'error');
         }
     } catch (error) {
         console.error('Unblock error:', error);
-        alert('❌ Erro ao conectar com o servidor');
+        showNotification('Erro ao conectar com o servidor', 'error');
     }
 }
 
@@ -1368,13 +1768,14 @@ async function handleRemoveFromWhitelist() {
         const data = await response.json();
 
         if (response.ok && data.success) {
-            alert(`✅ ${data.message}`);
+            showNotification(data.message, 'success');
+            await loadLists();
         } else {
-            alert(`❌ ${data.error || 'Erro ao remover da whitelist'}`);
+            showNotification(data.error || 'Erro ao remover da whitelist', 'error');
         }
     } catch (error) {
         console.error('Remove from whitelist error:', error);
-        alert('❌ Erro ao conectar com o servidor');
+        showNotification('Erro ao conectar com o servidor', 'error');
     }
 }
 
@@ -1382,174 +1783,559 @@ async function handleRemoveFromWhitelist() {
 // Lists Management Functions
 // ===========================
 
-async function loadLists() {
-    await loadBlocklist();
-    await loadWhitelist();
+function setupBlocklistSearch() {
+    const input = document.getElementById('blocklist-search');
+    if (!input) {
+        return;
+    }
+    input.addEventListener('input', (event) => {
+        const value = event.target.value || '';
+        if (blocklistSearchTimer) {
+            clearTimeout(blocklistSearchTimer);
+        }
+        updateBlocklistSearchControls();
+        blocklistSearchTimer = setTimeout(() => {
+            blocklistSearchTerm = value.trim();
+            blocklistPagination.page = 1;
+            loadBlocklist(1);
+        }, BLOCKLIST_SEARCH_DELAY);
+    });
+    input.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            clearBlocklistSearch();
+        }
+    });
+    updateBlocklistSearchControls();
+}
+
+function setupBlocklistTypeFilter() {
+    const filterContainer = document.getElementById('blocklist-filter');
+    if (!filterContainer) {
+        return;
+    }
+    filterContainer.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-type]');
+        if (!button) {
+            return;
+        }
+        const type = safeString(button.dataset.type || 'all').toLowerCase();
+        setBlocklistTypeFilter(type);
+    });
+    updateBlocklistFilterUI();
+}
+
+function setBlocklistTypeFilter(type) {
+    const normalized = safeString(type || 'all').toLowerCase();
+    blocklistTypeFilter = ALLOWED_BLOCKLIST_TYPES.has(normalized) ? normalized : 'all';
+    blocklistPagination.page = 1;
+    updateBlocklistFilterUI();
+    loadBlocklist(1);
+}
+
+function updateBlocklistFilterUI() {
+    const filterContainer = document.getElementById('blocklist-filter');
+    if (!filterContainer) {
+        return;
+    }
+    filterContainer.querySelectorAll('[data-type]').forEach((btn) => {
+        const isActive = safeString(btn.dataset.type).toLowerCase() === blocklistTypeFilter;
+        btn.classList.toggle('active', isActive);
+        btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+    });
+}
+
+function clearBlocklistSearch() {
+    if (blocklistSearchTimer) {
+        clearTimeout(blocklistSearchTimer);
+        blocklistSearchTimer = null;
+    }
+    blocklistSearchTerm = '';
+    blocklistPagination.page = 1;
+    const input = document.getElementById('blocklist-search');
+    if (input && input.value) {
+        input.value = '';
+    }
+    if (input) {
+        input.focus();
+    }
+    updateBlocklistSearchControls();
+    loadBlocklist(1);
+}
+
+function updateBlocklistSearchControls() {
+    const input = document.getElementById('blocklist-search');
+    const clearBtn = document.getElementById('blocklist-search-clear');
+    const hasValue = !!input?.value?.trim();
+    if (clearBtn) {
+        clearBtn.disabled = !hasValue;
+    }
+}
+
+async function loadLists(options = {}) {
+    const blockPromise = loadBlocklist(options.blocklistPage);
+    const whitePromise = loadWhitelist(options.whitelistPage);
+    await Promise.all([blockPromise, whitePromise]);
 }
 
 async function refreshLists() {
-    loadLists();
+    return loadLists();
 }
 
-async function loadBlocklist() {
+async function loadBlocklist(pageOverride) {
+    const requestedPage = Number.isFinite(pageOverride) ? pageOverride : (blocklistPagination.page || 1);
+    const page = Math.max(1, requestedPage);
+    const pageSize = getSafePageSize(blocklistPagination.pageSize);
+    const loadingMessage = blocklistSearchTerm ? 'Buscando na blacklist...' : 'Carregando blacklist...';
+    setListStatus('blocklist', loadingMessage);
+    const searchParam = blocklistSearchTerm ? `&search=${encodeURIComponent(blocklistSearchTerm)}` : '';
+    const typeParam = blocklistTypeFilter && blocklistTypeFilter !== 'all'
+        ? `&type=${encodeURIComponent(blocklistTypeFilter)}`
+        : '';
     try {
-        const response = await fetch(`${API_URL}/block/list`, {
+        const response = await fetch(`${API_URL}/block/list?page=${page}&page_size=${pageSize}${searchParam}${typeParam}`, {
             credentials: 'include'
         });
         const data = await response.json();
 
         if (response.ok && data.success) {
-            displayBlocklist(data.blocklist || []);
-            document.getElementById('blocklist-count').textContent = `${data.count || 0} itens`;
+            blocklistData = data.blocklist || [];
+            const total = data.count ?? blocklistData.length;
+            const totalAll = data.total_all ?? total;
+            const safePageSize = getSafePageSize(data.page_size || pageSize);
+            const totalPages = calculateTotalPages(total, safePageSize);
+            blocklistPagination.total = total;
+            blocklistPagination.pageSize = safePageSize;
+            blocklistPagination.page = total > 0 ? Math.min(data.page || page, totalPages) : 1;
+            blocklistPagination.totalPages = totalPages;
+            displayBlocklist(blocklistData);
+            const countLabel = blocklistSearchTerm
+                ? `${total} itens encontrados${totalAll > total ? ` (de ${totalAll})` : ''}`
+                : `${total} itens`;
+            document.getElementById('blocklist-count').textContent = countLabel;
+            updatePaginationControls('blocklist');
+            const typeLabel = blocklistTypeFilter !== 'all' ? getTypeLabel(blocklistTypeFilter) : '';
+            let statusMessage;
+            if (total > 0) {
+                statusMessage = `Mostrando ${formatListRange(blocklistPagination.page, safePageSize, total)}`;
+                if (blocklistSearchTerm) {
+                    statusMessage += ` filtrado por "${blocklistSearchTerm}"`;
+                }
+                if (typeLabel) {
+                    statusMessage += ` • Tipo: ${typeLabel}`;
+                }
+            } else {
+                statusMessage = blocklistSearchTerm
+                    ? `Nenhum item encontrado para "${blocklistSearchTerm}"`
+                    : typeLabel
+                        ? `Nenhum item para tipo: ${typeLabel}`
+                        : 'Nenhum item bloqueado';
+            }
+            setListStatus('blocklist', statusMessage);
         } else {
             console.error('Error loading blocklist:', data.error);
             document.getElementById('blocklist-tbody').innerHTML =
                 '<tr><td colspan="3" class="error">Erro ao carregar blacklist</td></tr>';
+            resetListPagination('blocklist');
+            updatePaginationControls('blocklist');
+            setListStatus('blocklist', data.error || 'Erro ao carregar blacklist', true);
         }
     } catch (error) {
         console.error('Load blocklist error:', error);
         document.getElementById('blocklist-tbody').innerHTML =
             '<tr><td colspan="3" class="error">Erro ao conectar com o servidor</td></tr>';
+        resetListPagination('blocklist');
+        updatePaginationControls('blocklist');
+        setListStatus('blocklist', 'Erro ao conectar com o servidor', true);
     }
 }
 
-async function loadWhitelist() {
+async function loadWhitelist(pageOverride) {
+    const requestedPage = Number.isFinite(pageOverride) ? pageOverride : (whitelistPagination.page || 1);
+    const page = Math.max(1, requestedPage);
+    const pageSize = getSafePageSize(whitelistPagination.pageSize);
+    setListStatus('whitelist', 'Carregando whitelist...');
     try {
-        const response = await fetch(`${API_URL}/white/list`, {
+        const response = await fetch(`${API_URL}/white/list?page=${page}&page_size=${pageSize}`, {
             credentials: 'include'
         });
         const data = await response.json();
 
         if (response.ok && data.success) {
-            displayWhitelist(data.whitelist || []);
-            document.getElementById('whitelist-count').textContent = `${data.count || 0} itens`;
+            whitelistData = data.whitelist || [];
+            const total = data.count ?? whitelistData.length;
+            const safePageSize = getSafePageSize(data.page_size || pageSize);
+            const totalPages = calculateTotalPages(total, safePageSize);
+            whitelistPagination.total = total;
+            whitelistPagination.pageSize = safePageSize;
+            whitelistPagination.page = total > 0 ? Math.min(data.page || page, totalPages) : 1;
+            whitelistPagination.totalPages = totalPages;
+            displayWhitelist(whitelistData);
+            document.getElementById('whitelist-count').textContent = `${total} itens`;
+            updatePaginationControls('whitelist');
+            const statusMessage = total > 0
+                ? `Mostrando ${formatListRange(whitelistPagination.page, safePageSize, total)}`
+                : 'Nenhum item na whitelist';
+            setListStatus('whitelist', statusMessage);
         } else {
             console.error('Error loading whitelist:', data.error);
             document.getElementById('whitelist-tbody').innerHTML =
                 '<tr><td colspan="3" class="error">Erro ao carregar whitelist</td></tr>';
+            resetListPagination('whitelist');
+            updatePaginationControls('whitelist');
+            setListStatus('whitelist', data.error || 'Erro ao carregar whitelist', true);
         }
     } catch (error) {
         console.error('Load whitelist error:', error);
         document.getElementById('whitelist-tbody').innerHTML =
             '<tr><td colspan="3" class="error">Erro ao conectar com o servidor</td></tr>';
+        resetListPagination('whitelist');
+        updatePaginationControls('whitelist');
+        setListStatus('whitelist', 'Erro ao conectar com o servidor', true);
     }
+}
+
+function formatTimestamp(timestamp) {
+    if (!timestamp) {
+        return '<span style="color: #888;">-</span>';
+    }
+
+    try {
+        // Parse ISO format: 2025-11-25T20:17:01.160091
+        const date = new Date(timestamp);
+
+        // Format as DD/MM/YYYY HH:MM:SS
+        const day = String(date.getDate()).padStart(2, '0');
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const year = date.getFullYear();
+        const hours = String(date.getHours()).padStart(2, '0');
+        const minutes = String(date.getMinutes()).padStart(2, '0');
+        const seconds = String(date.getSeconds()).padStart(2, '0');
+
+        return `${day}/${month}/${year} ${hours}:${minutes}:${seconds}`;
+    } catch (e) {
+        return '<span style="color: #888;">-</span>';
+    }
+}
+
+function formatBlockToken(item) {
+    const token = safeString(item?.token);
+    if (item?.type === 'pair' && token.includes('>@')) {
+        const [from, to] = token.split('>@');
+        const fromSafe = escapeHtml(from);
+        const toSafe = escapeHtml(to);
+        return `<span class="pair-token"><code>${fromSafe}</code><span class="pair-arrow">→</span><code>${toSafe}</code></span>`;
+    }
+    return `<code>${escapeHtml(token)}</code>`;
 }
 
 function displayBlocklist(blocklist) {
     const tbody = document.getElementById('blocklist-tbody');
+    const selectAll = document.getElementById('blocklist-select-all');
+    if (selectAll) selectAll.checked = false;
 
     if (!blocklist || blocklist.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="3" class="empty">Nenhum item bloqueado</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">Nenhum item bloqueado</td></tr>';
         return;
     }
 
-    tbody.innerHTML = blocklist.map(item => `
-        <tr>
-            <td><code>${item.token}</code></td>
-            <td><span class="type-badge type-${item.type}">${getTypeLabel(item.type)}</span></td>
-            <td class="action-cell">
-                <button
-                    class="btn-action btn-block"
-                    onclick="removeFromBlocklist('${item.token.replace(/'/g, "\\'")}')"
-                    title="Remover da blacklist"
-                >
-                    <span class="icon">🗑️</span>
-                </button>
-            </td>
-        </tr>
-    `).join('');
+    // Otimização: usar DocumentFragment para reduzir reflows
+    const fragment = document.createDocumentFragment();
+    const template = document.createElement('template');
+
+    blocklist.forEach(item => {
+	        template.innerHTML = `
+	            <tr>
+	                <td><input type="checkbox" class="list-checkbox blocklist-checkbox" data-token="${escapeHtml(item.token)}"></td>
+	                <td>${formatBlockToken(item)}</td>
+	                <td><span class="type-badge type-${escapeHtml(item.type)}">${getTypeLabel(item.type)}</span></td>
+	                <td style="font-size: 0.85em;">${formatTimestamp(item.timestamp)}</td>
+	            </tr>
+	        `;
+        fragment.appendChild(template.content.firstElementChild);
+    });
+
+    tbody.innerHTML = '';
+    tbody.appendChild(fragment);
 }
 
 function displayWhitelist(whitelist) {
     const tbody = document.getElementById('whitelist-tbody');
+    const selectAll = document.getElementById('whitelist-select-all');
+    if (selectAll) selectAll.checked = false;
 
     if (!whitelist || whitelist.length === 0) {
         tbody.innerHTML = '<tr><td colspan="3" class="empty">Nenhum item na whitelist</td></tr>';
         return;
     }
 
-    tbody.innerHTML = whitelist.map(item => `
-        <tr>
-            <td><code>${item.token}</code></td>
-            <td><span class="type-badge type-${item.type}">${getTypeLabel(item.type)}</span></td>
-            <td class="action-cell">
-                <button
-                    class="btn-action btn-block"
-                    onclick="removeFromWhitelist('${item.token.replace(/'/g, "\\'")}')"
-                    title="Remover da whitelist"
-                >
-                    <span class="icon">🗑️</span>
-                </button>
-            </td>
-        </tr>
-    `).join('');
+    // Otimização: usar DocumentFragment para reduzir reflows
+    const fragment = document.createDocumentFragment();
+    const template = document.createElement('template');
+
+    whitelist.forEach(item => {
+        template.innerHTML = `
+            <tr>
+                <td><input type="checkbox" class="list-checkbox whitelist-checkbox" data-token="${escapeHtml(item.token)}"></td>
+                <td><code>${escapeHtml(item.token)}</code></td>
+                <td><span class="type-badge type-${escapeHtml(item.type)}">${getTypeLabel(item.type)}</span></td>
+            </tr>
+        `;
+        fragment.appendChild(template.content.firstElementChild);
+    });
+
+    tbody.innerHTML = '';
+    tbody.appendChild(fragment);
+}
+
+function getListState(listType) {
+    return listType === 'blocklist' ? blocklistPagination : whitelistPagination;
+}
+
+function resetListPagination(listType) {
+    const state = getListState(listType);
+    if (!state) return;
+    state.page = 1;
+    state.total = 0;
+    state.totalPages = 1;
+    state.pageSize = LIST_PAGE_SIZE;
+}
+
+function updatePaginationControls(listType) {
+    const state = getListState(listType);
+    if (!state) return;
+    const prevBtn = document.getElementById(`${listType}-page-prev`);
+    const nextBtn = document.getElementById(`${listType}-page-next`);
+    const info = document.getElementById(`${listType}-page-info`);
+    const hasItems = state.total > 0;
+    if (prevBtn) {
+        prevBtn.disabled = !hasItems || state.page <= 1;
+    }
+    if (nextBtn) {
+        nextBtn.disabled = !hasItems || state.page >= state.totalPages;
+    }
+    if (info) {
+        info.textContent = hasItems
+            ? `Página ${state.page}/${state.totalPages} • ${formatListRange(state.page, state.pageSize, state.total)}`
+            : 'Nenhum item';
+    }
+}
+
+function changeListPage(listType, direction) {
+    const state = getListState(listType);
+    if (!state) return;
+    const target = Math.min(state.totalPages, Math.max(1, state.page + direction));
+    if (target === state.page || state.total === 0) {
+        return;
+    }
+    if (listType === 'blocklist') {
+        loadBlocklist(target);
+    } else {
+        loadWhitelist(target);
+    }
 }
 
 function getTypeLabel(type) {
     const labels = {
         'ip': 'IP',
         'email': 'Email',
-        'domain': 'Domínio'
+        'domain': 'Domínio',
+        'pair': 'Campanha',
+        'all': 'Todos'
     };
     return labels[type] || type.toUpperCase();
 }
 
-async function removeFromBlocklist(token) {
-    if (!confirm(`Tem certeza que deseja REMOVER "${token}" da blacklist?`)) {
+function getSelectedTokens(listType) {
+    const selector = listType === 'block' ? '.blocklist-checkbox' : '.whitelist-checkbox';
+    return Array.from(document.querySelectorAll(`${selector}:checked`)).map(cb => cb.dataset.token);
+}
+
+function toggleSelectAll(listType) {
+    const selectAll = document.getElementById(`${listType}list-select-all`);
+    const selector = listType === 'block' ? '.blocklist-checkbox' : '.whitelist-checkbox';
+    const checked = !!selectAll?.checked;
+    document.querySelectorAll(selector).forEach(cb => { cb.checked = checked; });
+}
+
+async function apiBlockAdd(token) {
+    const response = await fetch(`${API_URL}/block/add`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        credentials: 'include',
+        body: JSON.stringify({ token })
+    });
+    const data = await response.json();
+    return { ok: response.ok && data.success, message: data.message, error: data.error };
+}
+
+async function apiBlockDrop(token) {
+    const response = await fetch(`${API_URL}/block/drop`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        credentials: 'include',
+        body: JSON.stringify({ token })
+    });
+    const data = await response.json();
+    return { ok: response.ok && data.success, message: data.message, error: data.error };
+}
+
+async function apiWhiteAdd(token) {
+    const response = await fetch(`${API_URL}/white/add`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        credentials: 'include',
+        body: JSON.stringify({ token })
+    });
+    const data = await response.json();
+    return { ok: response.ok && data.success, message: data.message, error: data.error };
+}
+
+async function apiWhiteDrop(token) {
+    const response = await fetch(`${API_URL}/white/drop`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        credentials: 'include',
+        body: JSON.stringify({ token })
+    });
+    const data = await response.json();
+    return { ok: response.ok && data.success, message: data.message, error: data.error };
+}
+
+async function addToBlocklist() {
+    const input = document.getElementById('blocklist-add-input');
+    const token = input.value.trim();
+
+    if (!token) {
+        showNotification('Digite um IP, domínio ou email para bloquear', 'warning');
         return;
     }
 
-    try {
-        const response = await fetch(`${API_URL}/block/drop`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            credentials: 'include',
-            body: JSON.stringify({ token })
-        });
+    // Validação básica
+    if (token.length < 3) {
+        showNotification('Token inválido (muito curto)', 'error');
+        return;
+    }
 
-        const data = await response.json();
+    setListStatus('blocklist', `Bloqueando "${token}"...`);
 
-        if (response.ok && data.success) {
-            alert(`✅ ${data.message}`);
-            loadBlocklist(); // Recarregar lista
-        } else {
-            alert(`❌ ${data.error || 'Erro ao remover da blacklist'}`);
-        }
-    } catch (error) {
-        console.error('Remove from blocklist error:', error);
-        alert('❌ Erro ao conectar com o servidor');
+    const result = await apiBlockAdd(token);
+
+    if (result.ok) {
+        showNotification(`✅ ${result.message || 'Item bloqueado com sucesso'}`, 'success');
+        input.value = ''; // Limpar campo
+        await loadBlocklist(); // Recarregar lista
+    } else {
+        showNotification(`❌ ${result.error || 'Erro ao bloquear'}`, 'error');
+        setListStatus('blocklist', result.error || 'Erro ao bloquear', true);
     }
 }
 
-async function removeFromWhitelist(token) {
-    if (!confirm(`Tem certeza que deseja REMOVER "${token}" da whitelist?`)) {
+async function bulkUnblock() {
+    const tokens = getSelectedTokens('block');
+    if (tokens.length === 0) {
+        showNotification('Selecione itens para desbloquear', 'warning');
+        return;
+    }
+    let ok = 0, fail = 0;
+    for (const token of tokens) {
+        const res = await apiBlockDrop(token.trim());
+        if (res.ok) ok++; else fail++;
+    }
+    await loadLists();
+    if (fail > 0) {
+        showNotification(`Desbloqueio: ${ok} ok, ${fail} falhas`, 'warning');
+    } else {
+        showNotification(`${ok} ${ok === 1 ? 'item' : 'itens'} desbloqueado(s)`, 'success');
+    }
+}
+
+async function bulkUnblockAndWhitelist() {
+    const tokens = getSelectedTokens('block');
+    if (tokens.length === 0) {
+        showNotification('Selecione itens para desbloquear e colocar na whitelist', 'warning');
+        return;
+    }
+    let ok = 0, fail = 0;
+    for (const token of tokens) {
+        const drop = await apiBlockDrop(token.trim());
+        const add = await apiWhiteAdd(token.trim());
+        if (drop.ok && add.ok) {
+            ok++;
+        } else {
+            fail++;
+        }
+    }
+    await loadLists();
+    if (fail > 0) {
+        showNotification(`Desbloqueio + whitelist: ${ok} ok, ${fail} falhas`, 'warning');
+    } else {
+        showNotification(`${ok} ${ok === 1 ? 'item' : 'itens'} desbloqueado(s) e adicionado(s) à whitelist`, 'success');
+    }
+}
+
+async function bulkWhitelist() {
+    const tokens = getSelectedTokens('block');
+    if (tokens.length === 0) {
+        showNotification('Selecione itens para adicionar à whitelist', 'warning');
+        return;
+    }
+    let ok = 0, fail = 0;
+    for (const token of tokens) {
+        await apiBlockDrop(token.trim());
+        const add = await apiWhiteAdd(token.trim());
+        if (add.ok) ok++; else fail++;
+    }
+    await loadLists();
+    if (fail > 0) {
+        showNotification(`Whitelist: ${ok} ok, ${fail} falhas`, 'warning');
+    } else {
+        showNotification(`${ok} ${ok === 1 ? 'item' : 'itens'} adicionado(s) à whitelist`, 'success');
+    }
+}
+
+async function addToWhitelist() {
+    const input = document.getElementById('whitelist-add-input');
+    const token = input.value.trim();
+
+    if (!token) {
+        showNotification('Digite um IP, domínio ou email para adicionar', 'warning');
         return;
     }
 
-    try {
-        const response = await fetch(`${API_URL}/white/drop`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            credentials: 'include',
-            body: JSON.stringify({ token })
-        });
-
-        const data = await response.json();
-
-        if (response.ok && data.success) {
-            alert(`✅ ${data.message}`);
-            loadWhitelist(); // Recarregar lista
-        } else {
-            alert(`❌ ${data.error || 'Erro ao remover da whitelist'}`);
-        }
-    } catch (error) {
-        console.error('Remove from whitelist error:', error);
-        alert('❌ Erro ao conectar com o servidor');
+    // Validação básica
+    if (token.length < 3) {
+        showNotification('Token inválido (muito curto)', 'error');
+        return;
     }
+
+    setListStatus('whitelist', `Adicionando "${token}" à whitelist...`);
+
+    const result = await apiWhiteAdd(token);
+
+    if (result.ok) {
+        showNotification(`✅ ${result.message || 'Item adicionado à whitelist com sucesso'}`, 'success');
+        input.value = ''; // Limpar campo
+        await loadWhitelist(); // Recarregar lista
+    } else {
+        showNotification(`❌ ${result.error || 'Erro ao adicionar à whitelist'}`, 'error');
+        setListStatus('whitelist', result.error || 'Erro ao adicionar', true);
+    }
+}
+
+async function bulkRemoveWhitelist() {
+    const tokens = getSelectedTokens('white');
+    if (tokens.length === 0) {
+        setListStatus('whitelist', 'Selecione itens para remover da whitelist', true);
+        return;
+    }
+    setListStatus('whitelist', 'Removendo da whitelist...');
+    let ok = 0, fail = 0;
+    for (const token of tokens) {
+        const res = await apiWhiteDrop(token.trim());
+        if (res.ok) ok++; else fail++;
+    }
+    await loadLists();
+    setListStatus('whitelist', `Remoção concluída: ${ok} ok, ${fail} falhas`, fail > 0);
 }
 
 
@@ -1840,3 +2626,365 @@ async function handleAddUser(event) {
         submitBtn.textContent = 'Adicionar Usuário';
     }
 }
+
+// ===========================
+// Helpers de listas
+// ===========================
+
+function setListStatus(listName, message, isError = false) {
+    const el = document.getElementById(`${listName}-status`);
+    if (!el) return;
+    el.textContent = message || '';
+    el.style.color = isError ? '#ef4444' : 'var(--text-secondary)';
+}
+
+/* ========== Sistema de Notificações ========== */
+
+function showNotification(message, type, duration) {
+    type = type || 'success';
+    duration = duration || 2500;
+
+    const container = document.getElementById('notification-container');
+    if (!container) {
+        return;
+    }
+
+    const notification = document.createElement('div');
+    notification.className = 'notification ' + type;
+
+    const colors = {
+        'success': { bg: '#22c55e', text: '#ffffff', border: '#15803d' },
+        'error': { bg: '#ef4444', text: '#ffffff', border: '#dc2626' },
+        'info': { bg: '#3b82f6', text: '#ffffff', border: '#1d4ed8' },
+        'warning': { bg: '#f59e0b', text: '#ffffff', border: '#d97706' }
+    };
+
+    const color = colors[type] || colors['success'];
+
+    notification.style.backgroundColor = color.bg;
+    notification.style.color = color.text;
+    notification.style.padding = '18px 24px';
+    notification.style.borderLeft = '6px solid ' + color.border;
+    notification.style.borderTop = '2px solid ' + color.border;
+    notification.style.borderRight = '2px solid ' + color.border;
+    notification.style.borderBottom = '2px solid ' + color.border;
+    notification.style.borderRadius = '12px';
+    notification.style.boxShadow = '0 12px 32px rgba(0, 0, 0, 0.35), 0 6px 14px rgba(0, 0, 0, 0.2)';
+    notification.style.display = 'flex';
+    notification.style.alignItems = 'center';
+    notification.style.gap = '14px';
+    notification.style.minWidth = '280px';
+    notification.style.maxWidth = '380px';
+    notification.style.fontSize = '0.95rem';
+    notification.style.fontWeight = '500';
+
+    const icons = { 'success': '✓', 'error': '✕', 'info': 'ℹ', 'warning': '⚠' };
+
+    notification.innerHTML = '<span class="notification-icon" style="flex-shrink: 0; font-size: 1.6em; line-height: 1;">' + (icons[type] || '•') + '</span>' +
+        '<span class="notification-message" style="flex: 1; line-height: 1.5;">' + escapeHtml(message) + '</span>';
+
+    container.appendChild(notification);
+
+    setTimeout(function() {
+        notification.classList.add('exit');
+        setTimeout(function() {
+            notification.remove();
+        }, 300);
+    }, duration);
+}
+
+/* ========== Subdomain Campaign Blocker ========== */
+
+// Load subdomain campaign configuration
+async function loadSubdomainCampaignConfig() {
+    try {
+        const response = await fetch('/api/addon/subdomain-campaign/config');
+        if (!response.ok) {
+            throw new Error('Falha ao carregar configuração');
+        }
+
+        const data = await response.json();
+        const config = data.config || data;
+
+        // Update UI with config values
+        document.getElementById('subdomain-campaign-enabled').checked = config.enabled || false;
+        document.getElementById('subdomain-campaign-auto-block').checked = config.auto_block_enabled || false;
+        document.getElementById('subdomain-campaign-dry-run').checked = config.dry_run !== false;
+
+        document.getElementById('subdomain-campaign-window').value = config.window_hours || 6;
+        document.getElementById('subdomain-campaign-min-subdomains').value = config.min_subdomains || 3;
+        document.getElementById('subdomain-campaign-min-events').value = config.min_events_per_domain || 10;
+        document.getElementById('subdomain-campaign-poll').value = config.poll_seconds || 60;
+
+        const riskThresholdSlider = document.getElementById('subdomain-campaign-risk-threshold');
+        const riskThresholdValue = document.getElementById('subdomain-campaign-risk-threshold-value');
+        if (riskThresholdSlider && riskThresholdValue) {
+            riskThresholdSlider.value = config.risk_score_threshold || 70;
+            riskThresholdValue.textContent = config.risk_score_threshold || 70;
+        }
+
+        const blockAction = config.block_action || 'superblock';
+        document.getElementById('subdomain-campaign-block-action-superblock').checked = blockAction === 'superblock';
+        document.getElementById('subdomain-campaign-block-action-block').checked = blockAction === 'block';
+
+        // Update whitelist
+        const whitelist = config.local_whitelist || [];
+        document.getElementById('subdomain-campaign-whitelist').value = whitelist.join('\n');
+
+    } catch (error) {
+        console.error('Erro ao carregar configuração:', error);
+        showNotification('Erro ao carregar configuração: ' + error.message, 'error');
+    }
+}
+
+// Save subdomain campaign configuration
+async function saveSubdomainCampaignConfig() {
+    try {
+        const whitelistText = document.getElementById('subdomain-campaign-whitelist').value;
+        const whitelist = whitelistText.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+
+        const blockAction = document.getElementById('subdomain-campaign-block-action-superblock').checked ? 'superblock' : 'block';
+
+        const config = {
+            enabled: document.getElementById('subdomain-campaign-enabled').checked,
+            auto_block_enabled: document.getElementById('subdomain-campaign-auto-block').checked,
+            dry_run: document.getElementById('subdomain-campaign-dry-run').checked,
+            window_hours: parseInt(document.getElementById('subdomain-campaign-window').value),
+            min_subdomains: parseInt(document.getElementById('subdomain-campaign-min-subdomains').value),
+            min_events_per_domain: parseInt(document.getElementById('subdomain-campaign-min-events').value),
+            risk_score_threshold: parseInt(document.getElementById('subdomain-campaign-risk-threshold').value),
+            poll_seconds: parseInt(document.getElementById('subdomain-campaign-poll').value),
+            block_action: blockAction,
+            local_whitelist: whitelist
+        };
+
+        const response = await fetch('/api/addon/subdomain-campaign/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config)
+        });
+
+        if (!response.ok) {
+            throw new Error('Falha ao salvar configuração');
+        }
+
+        showNotification('Configuração salva com sucesso!', 'success');
+
+    } catch (error) {
+        console.error('Erro ao salvar configuração:', error);
+        showNotification('Erro ao salvar configuração: ' + error.message, 'error');
+    }
+}
+
+// Run subdomain campaign scan
+async function runSubdomainCampaignScan() {
+    const button = document.getElementById('subdomain-campaign-scan-button');
+    const originalText = button ? button.textContent : '';
+
+    try {
+        if (button) {
+            button.disabled = true;
+            button.textContent = '⏳ Executando scan...';
+        }
+
+        const autoBlockCheckbox = document.getElementById('subdomain-campaign-auto-block');
+        const autoBlock = autoBlockCheckbox ? autoBlockCheckbox.checked : false;
+        const response = await fetch('/api/addon/subdomain-campaign/scan?auto_block=' + (autoBlock ? 'true' : 'false'));
+
+        if (!response.ok) {
+            throw new Error('Falha ao executar scan');
+        }
+
+        const result = await response.json();
+
+        showNotification('Scan concluído! Campanhas detectadas: ' + result.total_campaigns, 'success');
+
+        // Render results
+        renderSubdomainCampaignResults(result);
+
+    } catch (error) {
+        console.error('Erro ao executar scan:', error);
+        showNotification('Erro ao executar scan: ' + error.message, 'error');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = originalText;
+        }
+    }
+}
+
+// Render subdomain campaign scan results
+function renderSubdomainCampaignResults(result) {
+    const container = document.getElementById('subdomain-campaign-results');
+    if (!container) return;
+
+    if (!result || !result.campaigns || result.campaigns.length === 0) {
+        container.innerHTML = '<div class="info-box" style="background: #f0f9ff; border-left: 4px solid #3b82f6;"><p style="margin: 0; color: #1e40af;">ℹ️ Nenhuma campanha detectada no último scan.</p></div>';
+        return;
+    }
+
+    let html = '<div style="margin-bottom: 1.5rem;">';
+    html += '<h3 style="color: #1f2937; margin: 0 0 1rem 0;">📊 Resumo do Scan</h3>';
+    html += '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem;">';
+    html += '<div style="background: #f0f9ff; padding: 1rem; border-radius: 8px; border-left: 4px solid #3b82f6;">';
+    html += '<div style="font-size: 0.875rem; color: #64748b; margin-bottom: 0.5rem;">Total de Campanhas</div>';
+    html += '<div style="font-size: 1.5rem; font-weight: bold; color: #1e40af;">' + result.total_campaigns + '</div>';
+    html += '</div>';
+    html += '<div style="background: #fef2f2; padding: 1rem; border-radius: 8px; border-left: 4px solid #ef4444;">';
+    html += '<div style="font-size: 0.875rem; color: #64748b; margin-bottom: 0.5rem;">Alto Risco (≥70)</div>';
+    html += '<div style="font-size: 1.5rem; font-weight: bold; color: #dc2626;">' + result.high_risk_campaigns + '</div>';
+    html += '</div>';
+    html += '<div style="background: #f0fdf4; padding: 1rem; border-radius: 8px; border-left: 4px solid #22c55e;">';
+    html += '<div style="font-size: 0.875rem; color: #64748b; margin-bottom: 0.5rem;">Bloqueios Realizados</div>';
+    html += '<div style="font-size: 1.5rem; font-weight: bold; color: #15803d;">' + (result.blocks_performed || 0) + '</div>';
+    html += '</div>';
+    html += '</div>';
+    html += '</div>';
+
+    html += '<h3 style="color: #1f2937; margin: 0 0 1rem 0;">🎯 Campanhas Detectadas</h3>';
+
+    result.campaigns.forEach((campaign, index) => {
+        const riskColor = campaign.risk_score >= 70 ? '#ef4444' : campaign.risk_score >= 50 ? '#f59e0b' : '#3b82f6';
+        const actionColor = campaign.recommended_action === 'BLOCK_SUPERBLOCK' ? '#dc2626' :
+                           campaign.recommended_action === 'BLOCK_DOMAIN' ? '#f59e0b' : '#64748b';
+
+        html += '<div class="campaign-card" style="background: white; border: 1px solid #e5e7eb; border-radius: 12px; padding: 1.5rem; margin-bottom: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">';
+
+        // Header
+        html += '<div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 1rem;">';
+        html += '<div style="flex: 1;">';
+        html += '<h4 style="margin: 0 0 0.5rem 0; color: #1f2937; font-size: 1.125rem;">🎯 ' + escapeHtml(campaign.base_domain) + '</h4>';
+        html += '<div style="display: flex; gap: 1rem; flex-wrap: wrap;">';
+        html += '<span style="font-size: 0.875rem; color: #64748b;">📅 ' + campaign.unique_subdomains + ' subdomínios</span>';
+        html += '<span style="font-size: 0.875rem; color: #64748b;">📧 ' + campaign.total_events + ' eventos</span>';
+        html += '<span style="font-size: 0.875rem; color: #64748b;">🌐 ' + campaign.unique_ips + ' IPs</span>';
+        html += '</div>';
+        html += '</div>';
+        html += '<div style="text-align: right;">';
+        html += '<div style="background: ' + riskColor + '; color: white; padding: 0.5rem 1rem; border-radius: 8px; font-weight: bold; margin-bottom: 0.5rem;">';
+        html += 'Score: ' + campaign.risk_score + '/100';
+        html += '</div>';
+        html += '<div style="color: ' + actionColor + '; font-size: 0.875rem; font-weight: 600;">';
+        html += campaign.recommended_action.replace('_', ' ');
+        html += '</div>';
+        html += '</div>';
+        html += '</div>';
+
+        // Risk factors
+        if (campaign.risk_factors && campaign.risk_factors.length > 0) {
+            html += '<div style="background: #fef2f2; border-left: 4px solid #ef4444; padding: 1rem; border-radius: 8px; margin-bottom: 1rem;">';
+            html += '<div style="font-weight: 600; color: #dc2626; margin-bottom: 0.5rem;">⚠️ Fatores de Risco:</div>';
+            html += '<ul style="margin: 0; padding-left: 1.5rem; color: #991b1b;">';
+            campaign.risk_factors.forEach(factor => {
+                html += '<li style="margin-bottom: 0.25rem;">' + escapeHtml(factor) + '</li>';
+            });
+            html += '</ul>';
+            html += '</div>';
+        }
+
+        // Details toggle
+        html += '<div style="margin-top: 1rem;">';
+        html += '<button onclick="toggleSubdomainCampaignDetails(' + index + ')" style="background: #f3f4f6; border: 1px solid #d1d5db; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-size: 0.875rem; color: #374151; width: 100%;">';
+        html += '<span id="subdomain-campaign-toggle-icon-' + index + '">▼</span> Ver detalhes';
+        html += '</button>';
+        html += '<div id="subdomain-campaign-details-' + index + '" style="display: none; margin-top: 1rem; padding: 1rem; background: #f9fafb; border-radius: 8px;">';
+
+        // Statistics
+        html += '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1rem;">';
+        html += '<div><span style="color: #64748b; font-size: 0.875rem;">Padrão numérico:</span> <strong>' + campaign.subdomains_with_pattern + ' (' + Math.round(campaign.pattern_percentage) + '%)</strong></div>';
+        html += '<div><span style="color: #64748b; font-size: 0.875rem;">Taxa PASS:</span> <strong>' + Math.round(campaign.pass_rate * 100) + '%</strong></div>';
+        html += '<div><span style="color: #64748b; font-size: 0.875rem;">Velocidade:</span> <strong>' + campaign.events_per_hour.toFixed(1) + ' eventos/hora</strong></div>';
+        html += '<div><span style="color: #64748b; font-size: 0.875rem;">Janela:</span> <strong>' + campaign.window_hours.toFixed(1) + ' horas</strong></div>';
+        html += '</div>';
+
+        // Top subdomains
+        if (campaign.top_subdomains && campaign.top_subdomains.length > 0) {
+            html += '<div style="margin-top: 1rem;">';
+            html += '<div style="font-weight: 600; color: #374151; margin-bottom: 0.5rem;">📋 Top Subdomínios:</div>';
+            html += '<div style="max-height: 200px; overflow-y: auto; background: white; border: 1px solid #e5e7eb; border-radius: 6px; padding: 0.5rem;">';
+            campaign.top_subdomains.forEach(sub => {
+                html += '<div style="padding: 0.5rem; border-bottom: 1px solid #f3f4f6; font-size: 0.875rem;">';
+                html += '<div style="font-family: monospace; color: #1e40af; margin-bottom: 0.25rem;">' + escapeHtml(sub.subdomain);
+                if (sub.pattern) {
+                    html += ' <span style="color: #dc2626;">[padrão: ' + escapeHtml(sub.pattern) + ']</span>';
+                }
+                html += '</div>';
+                html += '<div style="color: #64748b; font-size: 0.8125rem;">Eventos: ' + sub.count + ' | IPs: ' + sub.unique_ips + '</div>';
+                html += '</div>';
+            });
+            html += '</div>';
+            html += '</div>';
+        }
+
+        html += '</div>';
+        html += '</div>';
+        html += '</div>';
+    });
+
+    container.innerHTML = html;
+}
+
+// Toggle campaign details
+function toggleSubdomainCampaignDetails(index) {
+    const detailsDiv = document.getElementById('subdomain-campaign-details-' + index);
+    const icon = document.getElementById('subdomain-campaign-toggle-icon-' + index);
+
+    if (!detailsDiv || !icon) return;
+
+    if (detailsDiv.style.display === 'none') {
+        detailsDiv.style.display = 'block';
+        icon.textContent = '▲';
+    } else {
+        detailsDiv.style.display = 'none';
+        icon.textContent = '▼';
+    }
+}
+
+// Switch subdomain campaign tabs
+function switchSubdomainCampaignTab(tabName, event) {
+    // Remove active class from all tabs
+    const tabs = document.querySelectorAll('#subdomain-campaign .tab-content');
+    tabs.forEach(tab => {
+        tab.classList.remove('active');
+    });
+
+    // Remove active class from all buttons
+    const buttons = document.querySelectorAll('#subdomain-campaign .tab-button');
+    buttons.forEach(btn => {
+        btn.classList.remove('active');
+    });
+
+    // Show selected tab
+    const selectedTab = document.getElementById('subdomain-campaign-tab-' + tabName);
+    if (selectedTab) {
+        selectedTab.classList.add('active');
+    }
+
+    // Add active class to clicked button
+    if (event && event.target) {
+        event.target.classList.add('active');
+    }
+}
+
+// Update slider value display
+function updateSubdomainCampaignSliderValue(sliderId, valueId) {
+    const slider = document.getElementById(sliderId);
+    const valueDisplay = document.getElementById(valueId);
+
+    if (slider && valueDisplay) {
+        valueDisplay.textContent = slider.value;
+    }
+}
+
+// Initialize subdomain campaign listeners
+document.addEventListener('DOMContentLoaded', function() {
+    // Risk threshold slider listener
+    const riskSlider = document.getElementById('subdomain-campaign-risk-threshold');
+    const riskValue = document.getElementById('subdomain-campaign-risk-threshold-value');
+
+    if (riskSlider && riskValue) {
+        riskSlider.addEventListener('input', function() {
+            riskValue.textContent = this.value;
+        });
+    }
+});

@@ -8,6 +8,7 @@ import subprocess
 import json
 import re
 import os
+import sys
 import hmac
 import hashlib
 import secrets
@@ -18,14 +19,42 @@ import http.cookiejar
 import shutil
 import html
 import ipaddress
+import math
+import glob
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from http.cookies import SimpleCookie
+from socketserver import ThreadingMixIn
 
-FRAUD_EVENTS_FILE = '/opt/spfbl/data/fraud-events.json'
-FRAUD_TOKEN_FILE = '/opt/spfbl/data/fraud_token'
+# Caminhos base configuráveis (mantém defaults da instalação SPFBL)
+SPFBL_HOME = os.environ.get('SPFBL_HOME', '/opt/spfbl')
+WEB_DIR = os.path.join(SPFBL_HOME, 'web')
+DATA_DIR = os.path.join(SPFBL_HOME, 'data')
+ADDON_PATH = os.path.join(SPFBL_HOME, 'addon')
+LOG_DIR = os.environ.get('SPFBL_LOG_DIR', '/var/log/spfbl')
+CONF_FILE = os.path.join(SPFBL_HOME, 'spfbl.conf')
+CONF_LOCK_FILE = os.path.join(SPFBL_HOME, 'spfbl.conf.lock')
+REMOTE_INTEGRATION_FILE = os.path.join(SPFBL_HOME, 'REMOTE_INTEGRATION.md')
+DASHBOARD_USERS_FILE = os.environ.get(
+    'SPFBL_DASHBOARD_USERS_FILE',
+    os.path.join(SPFBL_HOME, 'dashboard_users.conf')
+)
+FRAUD_EVENTS_FILE = os.environ.get(
+    'SPFBL_FRAUD_EVENTS_FILE',
+    os.path.join(DATA_DIR, 'fraud-events.json')
+)
+FRAUD_TOKEN_FILE = os.environ.get(
+    'SPFBL_FRAUD_TOKEN_FILE',
+    os.path.join(DATA_DIR, 'fraud_token')
+)
 MAX_FRAUD_EVENTS = 500
+
+# Backup persistente para toggle de SMTP/alerts
+SMTP_BACKUP_FILE = os.environ.get(
+    'SPFBL_SMTP_BACKUP_FILE',
+    os.path.join(SPFBL_HOME, 'smtp-settings.backup.json')
+)
 
 # Configurações de Sessão (somente em memória)
 # NOTA: Para produção, considere usar Redis ou banco de dados para persistência
@@ -33,24 +62,175 @@ SESSION_TIMEOUT = 3600  # 1 hora em segundos
 MAX_LOGIN_ATTEMPTS = 3  # Máximo de tentativas de login (reduzido para segurança)
 LOCKOUT_TIME = 1800  # 30 minutos de bloqueio após exceder tentativas (aumentado)
 
+# Configurações de Rate Limiting para /api/user/check-status
+MAX_CHECK_STATUS_ATTEMPTS = 3  # Máximo de verificações por minuto
+RATE_LIMIT_WINDOW = 60  # Janela de 1 minuto em segundos
+
 # Configurações de Segurança de Cookies
 # Definir como True se estiver usando HTTPS em produção
 USE_SECURE_COOKIES = os.environ.get('SPFBL_USE_HTTPS', 'false').lower() == 'true'
 
 # Configurações de CORS - Origens permitidas
 # IMPORTANTE: Adicione aqui apenas as origens confiáveis
-ALLOWED_ORIGINS = [
-    'http://localhost:8002',
-    'http://127.0.0.1:8002',
-    'http://51.83.5.176:8002',
-    # Adicionar outras origens conforme necessário (domínios públicos, etc)
-]
+def load_allowed_origins():
+    raw = (os.environ.get('SPFBL_ALLOWED_ORIGINS') or '').strip()
+    origins = set()
+    if not raw:
+        return origins
+    for part in raw.split(','):
+        origin = part.strip()
+        if origin:
+            origins.add(origin.rstrip('/'))
+    return origins
+
+ALLOWED_ORIGINS = load_allowed_origins()
+
+# Addons (caminho único, relativo à instalação)
+SUBDOMAIN_CAMPAIGN_SERVICE = None
+
+if ADDON_PATH not in sys.path:
+    sys.path.append(ADDON_PATH)
+
+try:
+    from subdomain_campaign_blocker import SubdomainCampaignBlockerService
+    SUBDOMAIN_CAMPAIGN_SERVICE = SubdomainCampaignBlockerService()
+    SUBDOMAIN_CAMPAIGN_SERVICE.start_auto_runner()
+    print("[INFO] Subdomain Campaign Blocker carregado e iniciado", file=sys.stderr)
+except Exception as e:
+    print(f"[ERROR] Falha ao carregar Subdomain Campaign Blocker em {ADDON_PATH}: {e}", file=sys.stderr)
 
 # Armazenamento em memória (dicionários simples, sem chave secreta global)
 sessions = {}  # {token: {'email': 'user@domain', 'created': timestamp}}
 login_attempts = {}  # {ip: {'count': 0, 'locked_until': timestamp}}
+check_status_attempts = {}  # {ip: {'count': 0, 'reset_at': timestamp}} - Rate limiting para /api/user/check-status
 
 class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
+    # Timeout de segurança para prevenir conexões travadas
+    timeout = 30
+
+    # ===========================
+    # Auth / Roles / Scoping
+    # ===========================
+
+    def _get_session(self):
+        cookies = SimpleCookie(self.headers.get('Cookie', ''))
+        if 'session_token' not in cookies:
+            return None
+        token = cookies['session_token'].value
+        return sessions.get(token)
+
+    def _get_session_email(self):
+        session = self._get_session()
+        email = session.get('email') if session else None
+        return (email or '').strip().lower()
+
+    def is_admin_email(self, email):
+        admin_email = (self.get_admin_email() or '').strip().lower()
+        candidate = (email or '').strip().lower()
+        return bool(admin_email) and candidate == admin_email
+
+    def is_admin_session(self):
+        return self.is_admin_email(self._get_session_email())
+
+    def require_admin(self):
+        if self.is_admin_session():
+            return True
+        self.send_json_response({'error': 'Forbidden'}, 403)
+        return False
+
+    def _parse_clients_for_scope(self):
+        output = self.run_spfbl_command('client show') or ''
+        clients = []
+        for raw_line in output.split('\n'):
+            line = raw_line.strip()
+            if not line or line.startswith('ERROR'):
+                continue
+            try:
+                first = line.split()[0]
+                if ':' not in first:
+                    continue
+                hostname, cidr = first.rsplit(':', 1)
+                network = ipaddress.ip_network(cidr, strict=False)
+            except Exception:
+                continue
+            email_match = re.search(r'<([^>]+@[^>]+)>', line)
+            email = email_match.group(1).strip().lower() if email_match else None
+            clients.append({
+                'hostname': hostname.strip(),
+                'network': network,
+                'email': email
+            })
+        return clients
+
+    def get_user_allowed_networks(self, email):
+        if self.is_admin_email(email):
+            return None
+        candidate = (email or '').strip().lower()
+        if not candidate:
+            return []
+        networks = []
+        for client in self._parse_clients_for_scope():
+            if client.get('email') == candidate:
+                networks.append(client['network'])
+        return networks
+
+    def get_user_allowed_hostnames(self, email):
+        if self.is_admin_email(email):
+            return None
+        candidate = (email or '').strip().lower()
+        if not candidate:
+            return []
+        hosts = []
+        for client in self._parse_clients_for_scope():
+            if client.get('email') == candidate:
+                hosts.append(client['hostname'])
+        return hosts
+
+    def _extract_client_ip_from_log_line(self, line):
+        if not line:
+            return None
+        match = re.search(r'\bSPFBL\b[^\n]*?\s(\d{1,3}(?:\.\d{1,3}){3})(?:/\d{1,2})?\s', line)
+        if match:
+            return match.group(1)
+        return None
+
+    def _line_matches_allowed_networks(self, line, networks):
+        if networks is None:
+            return True
+        if not networks:
+            return False
+        ip_str = self._extract_client_ip_from_log_line(line)
+        if not ip_str:
+            return False
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        return any(ip_obj in net for net in networks)
+
+    def get_list_pagination(self, default_page_size=100):
+        """Return page and page_size when pagination params are present."""
+        try:
+            params = parse_qs(urlparse(self.path).query)
+        except Exception:
+            params = {}
+
+        if 'page' not in params and 'page_size' not in params:
+            return None, None
+
+        try:
+            page = int((params.get('page') or ['1'])[0])
+        except (TypeError, ValueError):
+            page = 1
+
+        try:
+            page_size = int((params.get('page_size') or [str(default_page_size)])[0])
+        except (TypeError, ValueError):
+            page_size = default_page_size
+
+        page = max(1, page)
+        page_size = max(1, min(page_size, 500))
+        return page, page_size
 
     def get_allowed_origin(self, origin):
         """
@@ -61,11 +241,15 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             return None
 
         # Verificar se a origem está na lista de permitidas
-        if origin in ALLOWED_ORIGINS:
-            return origin
+        origin_candidate = origin.rstrip('/')
+        if origin_candidate in ALLOWED_ORIGINS:
+            return origin_candidate
 
         # Permitir qualquer origem de localhost/127.0.0.1 em desenvolvimento
-        if origin.startswith('http://localhost:') or origin.startswith('http://127.0.0.1:'):
+        if (
+            origin.startswith('http://localhost:') or origin.startswith('http://127.0.0.1:')
+            or origin.startswith('https://localhost:') or origin.startswith('https://127.0.0.1:')
+        ):
             return origin
 
         # Não permitir outras origens
@@ -97,16 +281,16 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.serve_login_page()
             return
         if path == '/login.css':
-            self.serve_file('/opt/spfbl/web/login.css', 'text/css')
+            self.serve_file(os.path.join(WEB_DIR, 'login.css'), 'text/css')
             return
         if path == '/logo.png':
-            self.serve_file('/opt/spfbl/web/logo.png', 'image/png')
+            self.serve_file(os.path.join(WEB_DIR, 'logo.png'), 'image/png')
             return
         if path == '/version.js':
-            self.serve_file('/opt/spfbl/web/version.js', 'application/javascript')
+            self.serve_file(os.path.join(WEB_DIR, 'version.js'), 'application/javascript')
             return
         if path == '/version.txt':
-            self.serve_file('/opt/spfbl/web/version.txt', 'text/plain')
+            self.serve_file(os.path.join(WEB_DIR, 'version.txt'), 'text/plain')
             return
 
         # Extrair email da query string para verificação de status (público)
@@ -136,6 +320,28 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.send_json_response({'error': 'Unauthorized', 'redirect': '/login'}, 401)
             return
 
+        # Rotas administrativas (GET)
+        admin_only_get = {
+            '/api/clients',
+            '/api/users/list',
+            '/api/logs',
+            '/api/settings/config',
+            '/api/settings/smtp-status',
+            '/api/server/memory',
+            '/api/fraud-events',
+            '/api/addon/subdomain-campaign/config',
+            '/api/addon/subdomain-campaign/scan',
+            '/api/check-update',
+        }
+        if path in admin_only_get:
+            if not self.require_admin():
+                return
+        if path in {'/settings', '/settings.html'} and not self.is_admin_session():
+            self.send_response(302)
+            self.send_header('Location', '/dashboard.html')
+            self.end_headers()
+            return
+
         # API Routes
         if path == '/api/stats':
             self.get_stats()
@@ -147,6 +353,8 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.get_today_queries()
         elif path == '/api/user':
             self.get_current_user()
+        elif path == '/api/settings/smtp-status':
+            self.get_smtp_status()
         elif path == '/api/block/list':
             self.get_blocklist()
         elif path == '/api/white/list':
@@ -162,19 +370,29 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.get_fraud_events()
         elif path == '/api/server/memory':
             self.get_server_memory()
+        elif path == '/api/stats/spam-blocks':
+            self.get_spam_block_stats()
+        elif path == '/api/stats/spam-blocks/hourly':
+            self.get_spam_blocks_hourly()
+        elif path == '/api/addon/subdomain-campaign/config':
+            self.handle_subdomain_campaign_config_get()
+        elif path == '/api/addon/subdomain-campaign/scan':
+            self.handle_subdomain_campaign_scan()
         elif path == '/api/settings/config':
             self.handle_config()
+        elif path == '/api/check-update':
+            self.check_github_update()
         # Serve static files / dynamic settings page
         elif path in ['/', '/dashboard', '/dashboard.html']:
-            self.serve_file('/opt/spfbl/web/dashboard.html', 'text/html')
+            self.serve_file(os.path.join(WEB_DIR, 'dashboard.html'), 'text/html')
         elif path == '/settings' or path == '/settings.html':
             self.serve_settings_page()
         elif path == '/dashboard.css':
-            self.serve_file('/opt/spfbl/web/dashboard.css', 'text/css')
+            self.serve_file(os.path.join(WEB_DIR, 'dashboard.css'), 'text/css')
         elif path == '/dashboard.js':
-            self.serve_file('/opt/spfbl/web/dashboard.js', 'application/javascript')
+            self.serve_file(os.path.join(WEB_DIR, 'dashboard.js'), 'application/javascript')
         elif path == '/login.css':
-            self.serve_file('/opt/spfbl/web/login.css', 'text/css')
+            self.serve_file(os.path.join(WEB_DIR, 'login.css'), 'text/css')
         else:
             self.send_error(404, "Not found")
 
@@ -191,49 +409,74 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.handle_fraud_event_report()
         elif path == '/api/logout':
             self.handle_logout()
+        elif path == '/api/addon/subdomain-campaign/config':
+            if not self.is_authenticated():
+                self.send_json_response({'error': 'Unauthorized'}, 401)
+                return
+            if not self.require_admin():
+                return
+            self.handle_subdomain_campaign_config_post()
         elif path == '/api/clients/add':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
+                return
+            if not self.require_admin():
                 return
             self.handle_add_client()
         elif path == '/api/clients/remove':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
                 return
+            if not self.require_admin():
+                return
             self.handle_remove_clients()
         elif path == '/api/block/add':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
+                return
+            if not self.require_admin():
                 return
             self.handle_block_add()
         elif path == '/api/block/drop':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
                 return
+            if not self.require_admin():
+                return
             self.handle_block_drop()
         elif path == '/api/white/add':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
+                return
+            if not self.require_admin():
                 return
             self.handle_white_add()
         elif path == '/api/white/drop':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
                 return
+            if not self.require_admin():
+                return
             self.handle_white_drop()
         elif path == '/api/users/add':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
+                return
+            if not self.require_admin():
                 return
             self.handle_add_user()
         elif path == '/api/users/remove':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
                 return
+            if not self.require_admin():
+                return
             self.handle_remove_users()
         elif path == '/api/settings/config':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
+                return
+            if not self.require_admin():
                 return
             self.handle_config_update()
         elif path == '/settings' or path == '/settings.html':
@@ -243,12 +486,26 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 self.send_header('Location', '/login')
                 self.end_headers()
                 return
+            if not self.is_admin_session():
+                self.send_response(302)
+                self.send_header('Location', '/dashboard.html')
+                self.end_headers()
+                return
             self.handle_settings_form_post()
         elif path == '/api/users/send-totp':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
                 return
+            if not self.require_admin():
+                return
             self.handle_send_totp()
+        elif path == '/api/settings/smtp-toggle':
+            if not self.is_authenticated():
+                self.send_json_response({'error': 'Unauthorized'}, 401)
+                return
+            if not self.require_admin():
+                return
+            self.handle_smtp_toggle()
         elif path == '/api/server/memory':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
@@ -259,6 +516,20 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
     def check_user_totp_status(self, email):
         """Check if user has TOTP enabled (public endpoint)"""
+        # Rate limiting: 3 tentativas por minuto por IP
+        client_ip = self.client_address[0]
+
+        if self.is_check_status_rate_limited(client_ip):
+            self.send_json_response({
+                'error': 'Too many requests',
+                'message': f'Rate limit exceeded. Maximum {MAX_CHECK_STATUS_ATTEMPTS} requests per minute.',
+                'retry_after': 60
+            }, 429)
+            return
+
+        # Incrementar contador de tentativas
+        self.increment_check_status_attempts(client_ip)
+
         if not email or not self.is_valid_email(email):
             self.send_json_response({'error': 'Invalid email format'}, 400)
             return
@@ -275,58 +546,15 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # DEPOIS: Verificar se usuário existe
-            result = subprocess.run(
-                ['/sbin/spfbl', 'user', 'show'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-
-            if email not in result.stdout:
-                self.send_json_response({
-                    'success': False,
-                    'error': 'User not found',
-                    'has_totp': False
-                }, 404)
-                return
-
-            # Tentar acessar o painel antigo para verificar se tem TOTP
-            base_url = os.environ.get('SPFBL_PANEL_URL', 'http://127.0.0.1:8001')
-            try:
-                parsed = urllib.parse.urlparse(base_url)
-                if not parsed.scheme:
-                    base_url = 'http://' + base_url
-            except Exception:
-                base_url = 'http://127.0.0.1:8001'
-
-            email_path = '/' + urllib.parse.quote(email)
-
-            try:
-                response = urllib.request.urlopen(f"{base_url}{email_path}", timeout=3)
-                html = response.read().decode('utf-8', errors='ignore')
-
-                # Se o HTML contém o painel de controle, usuário já tem TOTP
-                if "Painel de controle do SPFBL" in html or "SPFBL control panel" in html:
-                    self.send_json_response({
-                        'success': True,
-                        'has_totp': True,
-                        'message': 'User already has TOTP configured'
-                    })
-                else:
-                    # Se não mostrou o painel, provavelmente está pedindo TOTP
-                    self.send_json_response({
-                        'success': True,
-                        'has_totp': False,
-                        'message': 'User needs to set up TOTP'
-                    })
-            except Exception as e:
-                # Se não conseguir acessar o painel antigo, assumir que não tem TOTP
-                self.send_json_response({
-                    'success': True,
-                    'has_totp': False,
-                    'message': 'User needs to set up TOTP'
-                })
+            # O painel legado sempre retorna a página de login sem credenciais,
+            # então não é possível detectar TOTP de forma confiável via HTTP.
+            # Para evitar falsos negativos, retornamos has_totp=True aqui.
+            self.send_json_response({
+                'success': True,
+                'has_totp': True,
+                'message': 'TOTP status not detectable via API'
+            })
+            return
 
         except Exception as e:
             self.send_json_response({'error': f'Error checking status: {str(e)}'}, 500)
@@ -425,7 +653,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def _get_admin_email_from_conf(self):
         """Extract admin email from spfbl.conf using regex"""
         try:
-            with open('/opt/spfbl/spfbl.conf', 'r') as f:
+            with open(CONF_FILE, 'r') as f:
                 content = f.read()
                 # Usar regex para encontrar admin_email=...
                 match = re.search(r'^\s*admin_email\s*=\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\s*$',
@@ -439,7 +667,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def _get_admin_email_from_remote_integration(self):
         """Extract admin email from REMOTE_INTEGRATION.md using regex"""
         try:
-            with open('/opt/spfbl/REMOTE_INTEGRATION.md', 'r', encoding='utf-8') as f:
+            with open(REMOTE_INTEGRATION_FILE, 'r', encoding='utf-8') as f:
                 content = f.read()
                 # Procurar padrão: "Email admin:" seguido de email
                 # Procura "• Email admin:" ou similar
@@ -460,7 +688,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def get_recaptcha_keys(self):
         """Get reCAPTCHA keys from spfbl.conf (only if not commented)"""
         try:
-            with open('/opt/spfbl/spfbl.conf', 'r') as f:
+            with open(CONF_FILE, 'r') as f:
                 content = f.read()
 
                 # Buscar site key (ignora linhas comentadas)
@@ -523,6 +751,180 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
+    # ===========================
+    # SMTP / Abuse notifications toggle
+    # ===========================
+
+    def _read_spfbl_conf_lines(self):
+        try:
+            with open(CONF_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.readlines()
+        except Exception:
+            return []
+
+    def _parse_spfbl_conf_kv(self, lines=None):
+        if lines is None:
+            lines = self._read_spfbl_conf_lines()
+        kv = {}
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#') or '=' not in stripped:
+                continue
+            key, value = stripped.split('=', 1)
+            kv[key.strip().lower()] = value.strip()
+        return kv
+
+    def _compute_smtp_enabled(self, kv):
+        admin_email = (kv.get('admin_email') or '').strip()
+        smtp_host = (kv.get('smtp_host') or '').strip()
+        if not admin_email:
+            return False
+        if not smtp_host or smtp_host.lower() in {'none', 'false', '0', 'null'}:
+            return False
+        return True
+
+    def _set_conf_key_value(self, lines, key, value):
+        pattern = re.compile(rf'^\s*(?!#){re.escape(key)}\s*=', re.IGNORECASE)
+        found = False
+        new_lines = []
+        for line in lines:
+            if pattern.match(line):
+                prefix = line.split('=', 1)[0].rstrip()
+                new_lines.append(f"{prefix}={value}\n")
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f"{key}={value}\n")
+        return new_lines
+
+    def get_smtp_status(self):
+        try:
+            kv = self._parse_spfbl_conf_kv()
+            enabled = self._compute_smtp_enabled(kv)
+            self.send_json_response({'success': True, 'enabled': enabled})
+        except Exception as e:
+            self.send_json_response({'success': False, 'error': str(e)}, 500)
+
+    def handle_smtp_toggle(self):
+        """Enable/disable SPFBL outgoing SMTP (abuse reports, TOTP, etc.)."""
+        if self.is_config_locked():
+            self.send_json_response({
+                'error': 'Configuração protegida: arquivo spfbl.conf.lock existe. Remova o arquivo lock para editar.',
+                'locked': True
+            }, 403)
+            return
+
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length) if content_length > 0 else b'{}'
+            data = json.loads(body.decode('utf-8'))
+        except Exception:
+            self.send_json_response({'error': 'JSON inválido'}, 400)
+            return
+
+        desired_enabled = bool(data.get('enabled'))
+
+        lines = self._read_spfbl_conf_lines()
+        kv = self._parse_spfbl_conf_kv(lines)
+        current_enabled = self._compute_smtp_enabled(kv)
+
+        if desired_enabled == current_enabled:
+            self.send_json_response({
+                'success': True,
+                'enabled': current_enabled,
+                'message': 'SMTP já está no estado desejado'
+            })
+            return
+
+        smtp_keys = [
+            'admin_email',
+            'smtp_auth',
+            'smtp_starttls',
+            'smtp_host',
+            'smtp_port',
+            'smtp_user',
+            'smtp_password',
+            'dkim_selector',
+            'dkim_private',
+            'abuse_email'
+        ]
+
+        if not desired_enabled:
+            backup_data = {k: kv.get(k) for k in smtp_keys if k in kv}
+            try:
+                with open(SMTP_BACKUP_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(backup_data, f, ensure_ascii=False, indent=2)
+                try:
+                    os.chmod(SMTP_BACKUP_FILE, 0o600)
+                except Exception:
+                    pass
+            except Exception as e:
+                self.send_json_response({'error': f'Erro ao salvar backup SMTP: {str(e)}'}, 500)
+                return
+
+            # Desativa envio esvaziando host/porta/usuário e desabilitando auth.
+            # NÃO altera smtp_password para manter compatibilidade de login legado.
+            lines = self._set_conf_key_value(lines, 'smtp_host', '')
+            lines = self._set_conf_key_value(lines, 'smtp_port', '')
+            lines = self._set_conf_key_value(lines, 'smtp_user', '')
+            lines = self._set_conf_key_value(lines, 'smtp_auth', 'false')
+            lines = self._set_conf_key_value(lines, 'smtp_starttls', 'no')
+            if 'abuse_email' in kv:
+                lines = self._set_conf_key_value(lines, 'abuse_email', '')
+        else:
+            if not os.path.exists(SMTP_BACKUP_FILE):
+                self.send_json_response({
+                    'error': 'Não há backup SMTP para restaurar. Reconfigure manualmente no spfbl.conf.',
+                    'enabled': current_enabled
+                }, 400)
+                return
+            try:
+                with open(SMTP_BACKUP_FILE, 'r', encoding='utf-8') as f:
+                    backup_data = json.load(f) or {}
+            except Exception as e:
+                self.send_json_response({'error': f'Backup SMTP inválido: {str(e)}'}, 500)
+                return
+
+            for key, val in backup_data.items():
+                if val is None:
+                    continue
+                lines = self._set_conf_key_value(lines, key, str(val))
+
+        backup_file = f'{CONF_FILE}.backup-{int(time.time())}'
+        try:
+            shutil.copy2(CONF_FILE, backup_file)
+        except Exception as e:
+            self.send_json_response({'error': f'Erro ao fazer backup da configuração: {str(e)}'}, 500)
+            return
+
+        try:
+            with open(CONF_FILE, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+        except Exception as e:
+            try:
+                shutil.copy2(backup_file, CONF_FILE)
+            except Exception:
+                pass
+            self.send_json_response({'error': f'Erro ao salvar configuração: {str(e)}'}, 500)
+            return
+
+        restarted = True
+        restart_error = None
+        try:
+            subprocess.run(['systemctl', 'restart', 'spfbl'], timeout=10)
+        except Exception as e:
+            restarted = False
+            restart_error = str(e)
+
+        self.send_json_response({
+            'success': True,
+            'enabled': desired_enabled,
+            'config_backup': backup_file,
+            'service_restarted': restarted,
+            'restart_error': restart_error
+        })
+
     def is_authenticated(self):
         """Verify if user is authenticated via session token"""
         cookies = SimpleCookie(self.headers.get('Cookie', ''))
@@ -554,16 +956,19 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
     def get_current_user(self):
         """Get current authenticated user info"""
-        cookies = SimpleCookie(self.headers.get('Cookie', ''))
-        token = cookies['session_token'].value
-
-        if token in sessions:
-            self.send_json_response({
-                'email': sessions[token]['email'],
-                'authenticated': True
-            })
-        else:
+        session = self._get_session()
+        if not session:
             self.send_json_response({'error': 'Not authenticated'}, 401)
+            return
+        email = (session.get('email') or '').strip()
+        is_admin = self.is_admin_email(email)
+        allowed_hosts = self.get_user_allowed_hostnames(email)
+        self.send_json_response({
+            'email': email,
+            'authenticated': True,
+            'is_admin': is_admin,
+            'allowed_hosts': allowed_hosts if allowed_hosts is not None else None
+        })
 
     def handle_login(self):
         """Handle login authentication"""
@@ -896,7 +1301,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             return False
 
     def verify_totp_with_spfbl(self, email, otp_code):
-        """Verify TOTP code against original SPFBL HTTP control panel.
+        """Verify TOTP/OTP code against original SPFBL HTTP control panel.
 
         AVISO DE SEGURANÇA:
         - Esta função delega autenticação ao painel legado em http://127.0.0.1:8001
@@ -905,9 +1310,9 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         - Considere migrar para autenticação nativa no futuro
 
         Fluxo:
-        1. Acessa http://127.0.0.1:8001/<email>?otp=<codigo> para submeter o TOTP.
-        2. Em seguida acessa http://127.0.0.1:8001/<email> com o mesmo cookie.
-        3. Se o HTML de resposta tiver o título do painel de controle, considera autenticado.
+        1. POST http://127.0.0.1:8001/<email> com body otp=<codigo>.
+        2. GET a mesma URL com o cookie retornado.
+        3. Considera autenticado se a resposta não for a página de login.
         """
         base_url = os.environ.get('SPFBL_PANEL_URL', 'http://127.0.0.1:8001')
 
@@ -924,33 +1329,11 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             base_url = 'http://127.0.0.1:8001'
 
         email_path = '/' + urllib.parse.quote(email)
-        query = urllib.parse.urlencode({'otp': str(otp_code)})
 
-        cookie_jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
-        opener.addheaders = [
-            ('User-Agent', 'spfbl-dashboard/2.0'),
-        ]
-
-        try:
-            # 1) Submeter código TOTP
-            url_with_otp = f"{base_url}{email_path}?{query}"
-            opener.open(url_with_otp, timeout=3)
-
-            # 2) Requisitar painel com o cookie retornado
-            panel_resp = opener.open(f"{base_url}{email_path}", timeout=3)
-            html = panel_resp.read().decode('utf-8', errors='ignore')
-        except Exception:
-            return False
-
-        # Verificar se é o painel de controle (PT ou EN)
-        if "Painel de controle do SPFBL" in html or "SPFBL control panel" in html:
-            return True
-
-        return False
+        return self._verify_legacy_otp_login(base_url, email_path, otp_code)
 
     def verify_password_with_spfbl(self, email, password):
-        """Verify password using the legacy SPFBL HTTP login (same endpoint usado para TOTP).
+        """Verify password/OTP using the legacy SPFBL HTTP login.
 
         AVISO DE SEGURANÇA:
         - Esta função delega autenticação ao painel legado em http://127.0.0.1:8001
@@ -959,9 +1342,9 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         - Considere migrar para autenticação nativa no futuro
 
         Fluxo:
-        1. POST http://127.0.0.1:8001/<email> com body password=<senha>
-        2. GET a mesma URL com o cookie retornado
-        3. Considera autenticado se a resposta contiver o painel de controle
+        1. POST http://127.0.0.1:8001/<email> com body otp=<codigo ou senha>.
+        2. GET a mesma URL com o cookie retornado.
+        3. Considera autenticado se a resposta não for a página de login.
         """
         base_url = os.environ.get('SPFBL_PANEL_URL', 'http://127.0.0.1:8001')
 
@@ -979,34 +1362,45 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
         email_path = '/' + urllib.parse.quote(email)
 
+        # Em versões atuais do painel legado, o campo de login é "otp".
+        # Para compatibilidade com versões antigas, enviamos otp e password com o mesmo valor.
+        return self._verify_legacy_otp_login(base_url, email_path, password)
+
+    def _is_legacy_authenticated_html(self, html_text):
+        if not html_text:
+            return False
+        html_lower = html_text.lower()
+        # Página de login explícita
+        if 'spfbl login page' in html_lower:
+            return False
+        # Se ainda contém campo otp, não autenticou
+        if re.search(r'name=[\"\\\']?otp\\b', html_lower):
+            return False
+        # Marcadores positivos conhecidos
+        if 'painel de controle' in html_lower or 'control panel' in html_lower:
+            return True
+        # Fallback: se não parece página de login, assume autenticado
+        return True
+
+    def _verify_legacy_otp_login(self, base_url, email_path, secret):
         cookie_jar = http.cookiejar.CookieJar()
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
-        opener.addheaders = [
-            ('User-Agent', 'spfbl-dashboard/2.0'),
-        ]
+        opener.addheaders = [('User-Agent', 'spfbl-dashboard/2.0')]
 
         try:
-            # 1) Submeter senha via POST (como o painel legado)
-            payload = urllib.parse.urlencode({'password': password}).encode('utf-8')
+            payload = urllib.parse.urlencode({'otp': secret, 'password': secret}).encode('utf-8')
             opener.open(f"{base_url}{email_path}", data=payload, timeout=3)
-
-            # 2) Requisitar painel com o cookie retornado
             panel_resp = opener.open(f"{base_url}{email_path}", timeout=3)
-            html = panel_resp.read().decode('utf-8', errors='ignore')
+            html_text = panel_resp.read().decode('utf-8', errors='ignore')
         except Exception:
             return False
 
-        # Verificar se é o painel de controle (PT ou EN)
-        html_lower = html.lower()
-        if "painel de controle do spfbl" in html_lower or "spfbl control panel" in html_lower:
-            return True
-
-        return False
+        return self._is_legacy_authenticated_html(html_text)
 
     def verify_against_config(self, email, password):
         """Verify against a secure configuration file"""
         # Arquivo de senhas hash (criar separadamente)
-        config_file = '/opt/spfbl/dashboard_users.conf'
+        config_file = DASHBOARD_USERS_FILE
 
         if not os.path.exists(config_file):
             # Se arquivo não existe, criar com usuário padrão do spfbl.conf
@@ -1034,7 +1428,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             # Se você precisa de um usuário padrão, configure em spfbl.conf
 
             # Procurar configuração de admin_email no spfbl.conf
-            with open('/opt/spfbl/spfbl.conf', 'r') as f:
+            with open(CONF_FILE, 'r') as f:
                 content = f.read()
 
                 # CORREÇÃO DE SEGURANÇA: Usar regex para validação exata da linha
@@ -1120,6 +1514,44 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         if ip in login_attempts:
             del login_attempts[ip]
 
+    def is_check_status_rate_limited(self, ip):
+        """Check if IP is rate limited for /api/user/check-status endpoint"""
+        if ip not in check_status_attempts:
+            return False
+
+        attempts = check_status_attempts[ip]
+        current_time = time.time()
+
+        # Se a janela de tempo expirou, resetar contador
+        if current_time > attempts.get('reset_at', 0):
+            del check_status_attempts[ip]
+            return False
+
+        # Verificar se excedeu o limite
+        if attempts.get('count', 0) >= MAX_CHECK_STATUS_ATTEMPTS:
+            return True
+
+        return False
+
+    def increment_check_status_attempts(self, ip):
+        """Increment check-status attempts for IP with 1-minute window"""
+        current_time = time.time()
+
+        if ip not in check_status_attempts:
+            check_status_attempts[ip] = {
+                'count': 0,
+                'reset_at': current_time + RATE_LIMIT_WINDOW
+            }
+
+        # Se a janela expirou, resetar
+        if current_time > check_status_attempts[ip].get('reset_at', 0):
+            check_status_attempts[ip] = {
+                'count': 0,
+                'reset_at': current_time + RATE_LIMIT_WINDOW
+            }
+
+        check_status_attempts[ip]['count'] += 1
+
     def cleanup_old_sessions(self):
         """Remove expired sessions"""
         current_time = time.time()
@@ -1180,7 +1612,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
     def serve_login_page(self):
         """Serve login page"""
-        self.serve_file('/opt/spfbl/web/login.html', 'text/html')
+        self.serve_file(os.path.join(WEB_DIR, 'login.html'), 'text/html')
 
     def serve_file(self, file_path, content_type):
         """Serve static files with correct Content-Type and security headers"""
@@ -1384,16 +1816,33 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def get_stats(self):
         """Get SPFBL statistics"""
         try:
-            log_file = f"/var/log/spfbl/spfbl.{datetime.now().strftime('%Y-%m-%d')}.log"
+            log_file = os.path.join(LOG_DIR, f"spfbl.{datetime.now().strftime('%Y-%m-%d')}.log")
             total_queries = 0
             blocked = 0
             passed = 0
             softfail = 0
             failed = 0
 
+            session_email = self._get_session_email()
+            allowed_networks = self.get_user_allowed_networks(session_email)
+            if allowed_networks is not None and not allowed_networks:
+                stats = {
+                    'total_queries': 0,
+                    'blocked': 0,
+                    'passed': 0,
+                    'softfail': 0,
+                    'failed': 0,
+                    'clients_connected': 0,
+                    'uptime': self.get_uptime()
+                }
+                self.send_json_response(stats)
+                return
+
             if os.path.exists(log_file):
-                with open(log_file, 'r') as f:
+                with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
                     for line in f:
+                        if not self._line_matches_allowed_networks(line, allowed_networks):
+                            continue
                         if 'SPF' in line and '=>' in line:
                             total_queries += 1
                             if '=> BLOCKED' in line or '=> BANNED' in line:
@@ -1405,12 +1854,20 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                             elif '=> FAIL' in line:
                                 failed += 1
 
+            # Count connected clients
+            clients_connected = 0
+            if allowed_networks is None:
+                output = self.run_spfbl_command('client show') or ''
+                if output and not output.startswith('ERROR'):
+                    clients_connected = len([line for line in output.strip().split('\n') if line.strip() and ':' in line])
+
             stats = {
                 'total_queries': total_queries,
                 'blocked': blocked,
                 'passed': passed,
                 'softfail': softfail,
                 'failed': failed,
+                'clients_connected': clients_connected,
                 'uptime': self.get_uptime()
             }
 
@@ -1458,17 +1915,24 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def get_recent_queries(self):
         """Get recent queries from log, prioritizing fraud events"""
         try:
-            log_file = f"/var/log/spfbl/spfbl.{datetime.now().strftime('%Y-%m-%d')}.log"
+            log_file = os.path.join(LOG_DIR, f"spfbl.{datetime.now().strftime('%Y-%m-%d')}.log")
             queries = []
             max_spf_queries = 50  # Reserve space for fraud events
+            session_email = self._get_session_email()
+            allowed_networks = self.get_user_allowed_networks(session_email)
 
             if os.path.exists(log_file):
-                with open(log_file, 'r') as f:
-                    lines = f.readlines()
+                from collections import deque
+                with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = deque(f, maxlen=20000)
 
                 count = 0
                 for line in reversed(lines):
-                    if 'SPF' in line and '=>' in line and count < max_spf_queries:
+                    if count >= max_spf_queries:
+                        break
+                    if not self._line_matches_allowed_networks(line, allowed_networks):
+                        continue
+                    if 'SPF' in line and '=>' in line:
                         # Improved regex: captures result only up to first space or special char
                         match = re.search(
                             r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[+-]\d{4}).*SPF\s+\'([^\']*?)\'.*\'([^\']*?)\'.*\'([^\']*?)\'.*\'([^\']*?)\'.*=>\s+([A-Z\-]+)',
@@ -1492,6 +1956,16 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             fraud_entries = []
             fraud_events = self.load_fraud_events()
             for event in reversed(fraud_events[-50:]):
+                if allowed_networks is not None:
+                    reporter_ip = event.get('reporter') or ''
+                    if not reporter_ip:
+                        continue
+                    try:
+                        reporter_obj = ipaddress.ip_address(reporter_ip)
+                    except ValueError:
+                        continue
+                    if not any(reporter_obj in net for net in allowed_networks):
+                        continue
                 fraud_data = {
                     'timestamp': event.get('timestamp', ''),
                     'ip': event.get('ip', ''),
@@ -1524,8 +1998,10 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def get_today_queries(self):
         """Get query statistics for today grouped by hour"""
         try:
-            log_file = f"/var/log/spfbl/spfbl.{datetime.now().strftime('%Y-%m-%d')}.log"
+            log_file = os.path.join(LOG_DIR, f"spfbl.{datetime.now().strftime('%Y-%m-%d')}.log")
             hourly_stats = {}
+            session_email = self._get_session_email()
+            allowed_networks = self.get_user_allowed_networks(session_email)
 
             for hour in range(24):
                 hourly_stats[hour] = {
@@ -1539,6 +2015,8 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             if os.path.exists(log_file):
                 with open(log_file, 'r') as f:
                     for line in f:
+                        if not self._line_matches_allowed_networks(line, allowed_networks):
+                            continue
                         if 'SPF' in line and '=>' in line:
                             match = re.search(r'T(\d{2}):', line)
                             if match:
@@ -1566,6 +2044,332 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.send_json_response(result)
         except Exception as e:
             self.send_json_response({'error': str(e)}, 500)
+
+    def get_spam_block_stats(self):
+        """Get SPAM blocking statistics from logs"""
+        try:
+            session_email = self._get_session_email()
+            allowed_networks = self.get_user_allowed_networks(session_email)
+            stats = self._calculate_spam_blocks(window_hours=24, allowed_networks=allowed_networks)
+            self.send_json_response(stats)
+        except Exception as e:
+            self.send_json_response({'error': str(e), 'success': False}, 500)
+
+    def get_spam_blocks_hourly(self):
+        """Get SPAM blocking statistics by hour of current day (0-23h)"""
+        try:
+            session_email = self._get_session_email()
+            allowed_networks = self.get_user_allowed_networks(session_email)
+            hourly = self._calculate_spam_blocks_today(allowed_networks=allowed_networks)
+            self.send_json_response(hourly)
+        except Exception as e:
+            self.send_json_response({'error': str(e), 'success': False}, 500)
+
+    # --- Subdomain Campaign Blocker Addon ---
+    def handle_subdomain_campaign_config_get(self):
+        if not SUBDOMAIN_CAMPAIGN_SERVICE:
+            self.send_json_response({'success': False, 'error': 'Subdomain Campaign Blocker não disponível'}, 500)
+            return
+        try:
+            self.send_json_response({'success': True, 'config': SUBDOMAIN_CAMPAIGN_SERVICE.config})
+        except Exception as e:
+            self.send_json_response({'success': False, 'error': str(e)}, 500)
+
+    def handle_subdomain_campaign_config_post(self):
+        if not SUBDOMAIN_CAMPAIGN_SERVICE:
+            self.send_json_response({'success': False, 'error': 'Subdomain Campaign Blocker não disponível'}, 500)
+            return
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            raw = self.rfile.read(content_length).decode('utf-8', errors='replace') if content_length > 0 else ''
+            data = json.loads(raw) if raw else {}
+        except Exception as e:
+            self.send_json_response({'success': False, 'error': f'JSON inválido: {str(e)}'}, 400)
+            return
+
+        try:
+            new_cfg = SUBDOMAIN_CAMPAIGN_SERVICE.update_config(data or {})
+            self.send_json_response({'success': True, 'config': new_cfg})
+        except Exception as e:
+            self.send_json_response({'success': False, 'error': str(e)}, 500)
+
+    def handle_subdomain_campaign_scan(self):
+        if not SUBDOMAIN_CAMPAIGN_SERVICE:
+            self.send_json_response({'success': False, 'error': 'Subdomain Campaign Blocker não disponível'}, 500)
+            return
+        try:
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            mode = (params.get('mode') or ['view'])[0]
+            auto_block = mode == 'block'
+
+            result = SUBDOMAIN_CAMPAIGN_SERVICE.scan(auto_block=auto_block)
+            status = 200 if result.get('success') else 400
+            self.send_json_response(result, status)
+        except Exception as e:
+            self.send_json_response({'success': False, 'error': str(e)}, 500)
+
+    # --- Helpers para estatísticas de SPAM (bloqueios diretos) ---
+    def _iter_spfbl_logs(self, start_time, end_time):
+        """
+        Itera linhas de log do SPFBL entre start_time e end_time (janela deslizante).
+        Lê arquivos do dia atual e do dia anterior se necessário (.log ou .log.gz).
+        """
+        import gzip
+
+        def open_file(path):
+            if path.endswith('.gz'):
+                return gzip.open(path, 'rt', encoding='utf-8', errors='ignore')
+            return open(path, 'r', encoding='utf-8', errors='ignore')
+
+        dates = {start_time.date(), end_time.date()}
+        for day in sorted(dates):
+            base = os.path.join(LOG_DIR, f"spfbl.{day.strftime('%Y-%m-%d')}.log")
+            candidates = [base, base + '.gz']
+            for path in candidates:
+                if os.path.exists(path):
+                    with open_file(path) as f:
+                        for line in f:
+                            yield line
+
+    def _parse_spfbl_timestamp(self, line):
+        """
+        Extrai datetime de uma linha de log SPFBL.
+        Formatos esperados: 2025-11-24T00:00:19.578-0300 ou sem frações.
+        """
+        ts_match = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{4})?)", line)
+        if not ts_match:
+            return None
+        ts_text = ts_match.group(1)
+        try:
+            # Tenta com micros + offset sem dois-pontos
+            return datetime.strptime(ts_text, '%Y-%m-%dT%H:%M:%S.%f%z')
+        except Exception:
+            try:
+                # Sem micros
+                return datetime.strptime(ts_text, '%Y-%m-%dT%H:%M:%S%z')
+            except Exception:
+                return None
+
+    def _calculate_spam_blocks(self, window_hours=24, by_hour=False, allowed_networks=None):
+        """
+        Conta bloqueios diretos do SPFBL em uma janela deslizante.
+        ip_blocked: total de eventos (=> BLOCKED/BANNED)
+        host_blocked: IPs que só enviaram 1 domínio na janela
+        domain_blocked: domínios que usaram >1 IP na janela
+        by_hour True devolve séries por hora (24 buckets relativos à janela).
+        """
+        from collections import defaultdict
+
+        end_time = datetime.now().astimezone()
+        start_time = end_time - timedelta(hours=window_hours)
+
+        if allowed_networks is not None and not allowed_networks:
+            result = {
+                'host_blocked': 0,
+                'domain_blocked': 0,
+                'ip_blocked': 0,
+                'success': True,
+                'window_start': start_time.isoformat(),
+                'window_end': end_time.isoformat()
+            }
+            if by_hour:
+                labels = [
+                    (start_time + timedelta(hours=idx)).strftime('%d/%m %Hh')
+                    for idx in range(window_hours)
+                ]
+                result.update({
+                    'hours': list(range(window_hours)),
+                    'labels': labels,
+                    'host_blocked': [0] * window_hours,
+                    'domain_blocked': [0] * window_hours,
+                    'ip_blocked': [0] * window_hours
+                })
+            return result
+
+        domains_por_ip = defaultdict(set)
+        ips_por_domain = defaultdict(set)
+        total_blocked = 0
+
+        # Estruturas por hora (0..23 representam a posição relativa na janela)
+        hourly_stats = [defaultdict(int) for _ in range(window_hours)]
+        hourly_tracking = [ {'domains_por_ip': defaultdict(set), 'ips_por_domain': defaultdict(set)} for _ in range(window_hours) ]
+
+        spf_regex = re.compile(r"SPF '([^']+)' '([^']+)' '([^']+)' '([^']+)'")
+
+        for line in self._iter_spfbl_logs(start_time, end_time):
+            if not self._line_matches_allowed_networks(line, allowed_networks):
+                continue
+            if '=> BLOCKED' not in line and '=> BANNED' not in line:
+                continue
+            if "SPF '" not in line:
+                continue
+
+            ts = self._parse_spfbl_timestamp(line)
+            if not ts or ts < start_time or ts > end_time:
+                continue
+
+            spf_match = spf_regex.search(line)
+            if not spf_match:
+                continue
+
+            origin_ip, sender, domain_remetente, recipient = spf_match.groups()
+            sender_domain = sender.split('@')[1] if '@' in sender else sender
+
+            total_blocked += 1
+            domains_por_ip[origin_ip].add(sender_domain)
+            ips_por_domain[sender_domain].add(origin_ip)
+
+            # Bucket horário relativo
+            if by_hour:
+                idx = int((ts - start_time).total_seconds() // 3600)
+                if 0 <= idx < window_hours:
+                    hourly_stats[idx]['ip_blocked'] += 1
+                    hourly_tracking[idx]['domains_por_ip'][origin_ip].add(sender_domain)
+                    hourly_tracking[idx]['ips_por_domain'][sender_domain].add(origin_ip)
+
+        # Agregados únicos
+        host_bloqueado_count = sum(1 for domains in domains_por_ip.values() if len(domains) == 1)
+        domain_bloqueado_count = sum(1 for ips in ips_por_domain.values() if len(ips) > 1)
+
+        result = {
+            'host_blocked': host_bloqueado_count,
+            'domain_blocked': domain_bloqueado_count,
+            'ip_blocked': total_blocked,
+            'success': True,
+            'window_start': start_time.isoformat(),
+            'window_end': end_time.isoformat()
+        }
+
+        if by_hour:
+            # Calcula host/domain por bucket horário
+            host_series = []
+            domain_series = []
+            ip_series = []
+            labels = []
+
+            for idx in range(window_hours):
+                domains_pi = hourly_tracking[idx]['domains_por_ip']
+                ips_pd = hourly_tracking[idx]['ips_por_domain']
+                host_series.append(sum(1 for d in domains_pi.values() if len(d) == 1))
+                domain_series.append(sum(1 for ips in ips_pd.values() if len(ips) > 1))
+                ip_series.append(hourly_stats[idx].get('ip_blocked', 0))
+                label_time = start_time + timedelta(hours=idx)
+                labels.append(label_time.strftime('%d/%m %Hh'))
+
+            result.update({
+                'hours': list(range(window_hours)),
+                'labels': labels,
+                'host_blocked': host_series,
+                'domain_blocked': domain_series,
+                'ip_blocked': ip_series
+            })
+
+        return result
+
+    def _calculate_spam_blocks_today(self, allowed_networks=None):
+        """
+        Calcula bloqueios diretos do SPFBL por hora do dia atual (0-23h).
+        Similar ao get_today_queries, mostra as 24 horas do dia corrente.
+        """
+        from collections import defaultdict
+
+        # Inicializar estruturas para 24 horas (0-23)
+        hourly_stats = {}
+        for hour in range(24):
+            hourly_stats[hour] = {
+                'ip_blocked': 0,
+                'domains_por_ip': defaultdict(set),
+                'ips_por_domain': defaultdict(set)
+            }
+
+        # Ler log do dia atual
+        today = datetime.now()
+        log_file = os.path.join(LOG_DIR, f"spfbl.{today.strftime('%Y-%m-%d')}.log")
+
+        if not os.path.exists(log_file):
+            # Se o arquivo não existe, retornar estrutura vazia
+            return {
+                'hours': list(range(24)),
+                'labels': [f'{h}:00' for h in range(24)],
+                'host_blocked': [0] * 24,
+                'domain_blocked': [0] * 24,
+                'ip_blocked': [0] * 24,
+                'success': True
+            }
+
+        if allowed_networks is not None and not allowed_networks:
+            return {
+                'hours': list(range(24)),
+                'labels': [f'{h}:00' for h in range(24)],
+                'host_blocked': [0] * 24,
+                'domain_blocked': [0] * 24,
+                'ip_blocked': [0] * 24,
+                'success': True
+            }
+
+        spf_regex = re.compile(r"SPF '([^']+)' '([^']+)' '([^']+)' '([^']+)'")
+
+        try:
+            with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if not self._line_matches_allowed_networks(line, allowed_networks):
+                        continue
+                    if '=> BLOCKED' not in line and '=> BANNED' not in line:
+                        continue
+                    if "SPF '" not in line:
+                        continue
+
+                    # Extrair hora da linha (formato: 2025-11-26T05:52:01.123-0300)
+                    match = re.search(r'T(\d{2}):', line)
+                    if not match:
+                        continue
+
+                    hour = int(match.group(1))
+
+                    # Extrair informações do SPF
+                    spf_match = spf_regex.search(line)
+                    if not spf_match:
+                        continue
+
+                    origin_ip, sender, domain_remetente, recipient = spf_match.groups()
+                    sender_domain = sender.split('@')[1] if '@' in sender else sender
+
+                    # Incrementar contadores
+                    hourly_stats[hour]['ip_blocked'] += 1
+                    hourly_stats[hour]['domains_por_ip'][origin_ip].add(sender_domain)
+                    hourly_stats[hour]['ips_por_domain'][sender_domain].add(origin_ip)
+
+        except Exception as e:
+            print(f"Error reading log file: {e}")
+
+        # Calcular séries para cada hora
+        host_series = []
+        domain_series = []
+        ip_series = []
+
+        for hour in range(24):
+            stats = hourly_stats[hour]
+            domains_pi = stats['domains_por_ip']
+            ips_pd = stats['ips_por_domain']
+
+            # Host bloqueado: IPs que só enviaram 1 domínio
+            host_count = sum(1 for domains in domains_pi.values() if len(domains) == 1)
+            # Domínio bloqueado: domínios que usaram >1 IP
+            domain_count = sum(1 for ips in ips_pd.values() if len(ips) > 1)
+
+            host_series.append(host_count)
+            domain_series.append(domain_count)
+            ip_series.append(stats['ip_blocked'])
+
+        return {
+            'hours': list(range(24)),
+            'labels': [f'{h}:00' for h in range(24)],
+            'host_blocked': host_series,
+            'domain_blocked': domain_series,
+            'ip_blocked': ip_series,
+            'success': True
+        }
 
     def handle_block_add(self):
         """Handle adding IP/domain/email to blacklist"""
@@ -1751,6 +2555,54 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json_response({'error': f'Erro: {str(e)}'}, 500)
 
+    def _looks_like_ip_or_cidr(self, value):
+        if not value:
+            return False
+        try:
+            if '/' in value:
+                ipaddress.ip_network(value, strict=False)
+            else:
+                ipaddress.ip_address(value)
+            return True
+        except Exception:
+            return False
+
+    def _block_token_variants(self, token):
+        variants = set()
+        if not token:
+            return variants
+        variants.add(token)
+        stripped = token.lstrip('.')
+        variants.add(stripped)
+        variants.add(f'.{stripped}')
+        if token.startswith('CIDR='):
+            raw_cidr = token[5:]
+            variants.add(raw_cidr)
+            variants.add(f'CIDR={raw_cidr}')
+        if self._looks_like_ip_or_cidr(stripped) and not stripped.startswith('CIDR='):
+            variants.add(f'CIDR={stripped}')
+        return variants
+
+    def _detect_block_token_type(self, raw_token):
+        token = (raw_token or '').strip()
+        if not token:
+            return 'domain', token
+        if '>@' in token:
+            token_type = 'pair'
+        elif token.startswith('CIDR=') or self._looks_like_ip_or_cidr(token):
+            token_type = 'ip'
+        elif '@' in token:
+            token_type = 'email'
+        else:
+            token_type = 'domain'
+
+        display = token
+        if display.startswith('CIDR='):
+            display = display[5:]
+        if display.startswith('.'):
+            display = display[1:]
+        return token_type, display
+
     def get_blocklist(self):
         """Get list of blocked IPs/domains/emails"""
         try:
@@ -1765,37 +2617,255 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             output = result.stdout.strip()
 
             if output:
+                raw_tokens = []
                 for line in output.split('\n'):
                     line = line.strip()
                     if line and not line.startswith('#'):
-                        # Formato típico: token ou token + data
+                        # Formato típico: CIDR=... ou .dominio ou email
                         parts = line.split()
                         if parts:
-                            token = parts[0]
-                            # Detectar tipo (IP, domínio ou email)
-                            if '@' in token:
-                                type_token = 'email'
-                            elif '.' in token and any(c.isdigit() for c in token):
-                                type_token = 'ip'
-                            else:
-                                type_token = 'domain'
+                            raw_token = parts[0]
+                            raw_tokens.append(raw_token)
 
-                            blocklist.append({
-                                'token': token,
-                                'type': type_token,
-                                'raw': line
-                            })
+                known_tokens = set()
+                for rt in raw_tokens:
+                    known_tokens.update(self._block_token_variants(rt))
+
+                timestamps = self.get_block_timestamps_from_logs(known_tokens=known_tokens)
+
+                for raw_token in raw_tokens:
+                    type_token, display_token = self._detect_block_token_type(raw_token)
+                    variants = self._block_token_variants(raw_token)
+                    ts_candidates = [timestamps.get(v) for v in variants if timestamps.get(v)]
+                    timestamp = max(ts_candidates) if ts_candidates else None
+                    blocklist.append({
+                        'token': display_token,
+                        'type': type_token,
+                        'raw': raw_token,
+                        'timestamp': timestamp
+                    })
+
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            search_term = (params.get('search') or [''])[0].strip()
+            type_filter = (params.get('type') or ['all'])[0].strip().lower()
+            allowed_types = {'all', 'ip', 'domain', 'email', 'pair'}
+            if type_filter not in allowed_types:
+                type_filter = 'all'
+
+            if search_term:
+                search_lower = search_term.lower()
+                filtered_list = [
+                    item for item in blocklist
+                    if search_lower in item['token'].lower() or search_lower in item.get('raw', '').lower()
+                ]
+            else:
+                filtered_list = blocklist
+
+            if type_filter != 'all':
+                filtered_list = [item for item in filtered_list if item.get('type') == type_filter]
+
+            # Ordena por timestamp (mais recente primeiro) de forma otimizada
+            # Itens sem timestamp (None or '') vão para o final
+            # Ordenação em ordem decrescente: timestamps maiores (mais recentes) primeiro
+            filtered_list.sort(key=lambda x: x.get('timestamp') or '', reverse=True)
+
+            total_all = len(blocklist)
+            total_items = len(filtered_list)
+            page, page_size = self.get_list_pagination(default_page_size=20)
+            pagination_enabled = page is not None and page_size is not None
+
+            if total_items == 0:
+                current_page = 1
+                total_pages = 1
+                paginated = []
+                current_page_size = page_size if pagination_enabled else 0
+            elif pagination_enabled:
+                total_pages = max(1, math.ceil(total_items / page_size))
+                current_page = min(page, total_pages)
+                start = (current_page - 1) * page_size
+                paginated = filtered_list[start:start + page_size]
+                current_page_size = page_size
+            else:
+                current_page = 1
+                total_pages = 1
+                paginated = filtered_list
+                current_page_size = total_items
 
             self.send_json_response({
                 'success': True,
-                'count': len(blocklist),
-                'blocklist': blocklist
+                'count': total_items,
+                'total_all': total_all,
+                'search': search_term,
+                'type': type_filter,
+                'blocklist': paginated,
+                'page': current_page,
+                'page_size': current_page_size,
+                'total_pages': total_pages
             })
 
         except subprocess.TimeoutExpired:
             self.send_json_response({'error': 'Timeout ao executar comando SPFBL'}, 500)
         except Exception as e:
             self.send_json_response({'error': f'Erro ao listar blacklist: {str(e)}'}, 500)
+
+    def get_block_timestamps_from_logs(self, known_tokens=None):
+        """
+        Extrai timestamps de bloqueios a partir de logs dos addons.
+        Versão otimizada: lê logs de addons e um recorte recente dos logs principais do SPFBL.
+        known_tokens: conjunto opcional de tokens/variações existentes em block show para filtrar ruído.
+        """
+        timestamps = {}
+
+        def store_token(token, ts):
+            if not token or not ts:
+                return
+            variants = self._block_token_variants(token)
+            if known_tokens is not None and variants.isdisjoint(known_tokens):
+                return
+            for v in variants:
+                prev = timestamps.get(v)
+                if not prev or ts > prev:
+                    timestamps[v] = ts
+
+        # Lista apenas logs de addons (não logs principais do SPFBL para performance)
+        addon_logs = [
+            os.path.join(LOG_DIR, 'addon-tld.log'),
+            os.path.join(LOG_DIR, 'addon-subdomain-campaign.log'),
+        ]
+
+        for log_path in addon_logs:
+            if not os.path.exists(log_path):
+                continue
+
+            try:
+                # Lê últimas 10000 linhas
+                result = subprocess.run(
+                    ['tail', '-10000', log_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+
+                for line in result.stdout.split('\n'):
+                    # Formato addon-subdomain-campaign: "2025-11-28T09:02:13.881378 BLOCKED [SUPERBLOCK] .domain"
+                    # Formato addon-tld: "2025-11-25T20:17:01.160091 BLOCK[IP] 179.209.47.218"
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+
+                    # Primeira parte é o timestamp
+                    ts = parts[0]
+
+                    # Detecta formato e extrai token
+                    token = None
+                    if 'BLOCKED' in line and '[' in line:
+                        # Formato: BLOCKED [SUPERBLOCK] .domain
+                        if len(parts) >= 3:
+                            token = parts[2]  # .domain
+                    elif 'BLOCK[' in line:
+                        # Formato: BLOCK[IP] token
+                        if len(parts) >= 3:
+                            token = parts[2]
+
+                    if not token or not ts:
+                        continue
+
+                    store_token(token, ts)
+
+            except Exception:
+                # Falha silenciosa - timestamps são opcionais
+                pass
+
+        # Logs principais do SPFBL (somente recorte recente)
+        now = datetime.now().astimezone()
+        main_logs = []
+        for delta in (0, 1):
+            day = (now - timedelta(days=delta)).strftime('%Y-%m-%d')
+            path = os.path.join(LOG_DIR, f"spfbl.{day}.log")
+            if os.path.exists(path):
+                main_logs.append(path)
+        if not main_logs:
+            candidates = sorted(glob.glob(os.path.join(LOG_DIR, 'spfbl.*.log')))
+            if candidates:
+                main_logs.append(candidates[-1])
+
+        def extract_domain_from_email(value):
+            if not value or '@' not in value:
+                return None
+            domain = value.split('@')[-1].strip().strip('>').strip()
+            if not domain or ';' in domain or '.' not in domain:
+                return None
+            if self._looks_like_ip_or_cidr(domain):
+                return None
+            if re.match(r'^[A-Za-z0-9.-]{1,253}$', domain):
+                return domain.lower()
+            return None
+
+        def extract_domain_from_helo(value):
+            if not value:
+                return None
+            helo = value.strip().strip('[]')
+            if not helo or ';' in helo or '.' not in helo:
+                return None
+            if self._looks_like_ip_or_cidr(helo):
+                return None
+            if re.match(r'^[A-Za-z0-9.-]{1,253}$', helo):
+                return helo.lower()
+            return None
+
+        for log_path in main_logs:
+            try:
+                result = subprocess.run(
+                    ['tail', '-20000', log_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                for line in result.stdout.split('\n'):
+                    if not re.search(r'=>\s*(BLOCKED|BANNED)\b', line):
+                        continue
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    ts = parts[0]
+
+                    spf_pos = line.find(' SPF ')
+                    quote_source = line[spf_pos:] if spf_pos != -1 else line
+                    quoted = re.findall(r"'([^']*)'", quote_source)
+                    if len(quoted) < 4:
+                        continue
+
+                    ip_value = quoted[0].strip()
+                    sender_value = quoted[1].strip()
+                    helo_value = quoted[2].strip()
+                    recipient_value = quoted[3].strip()
+
+                    sender_domain = extract_domain_from_helo(helo_value) or extract_domain_from_email(sender_value)
+                    recipient_domain = extract_domain_from_email(recipient_value)
+
+                    candidates = []
+                    if ip_value and self._looks_like_ip_or_cidr(ip_value):
+                        candidates.append(f'CIDR={ip_value}/32')
+                        candidates.append(ip_value)
+                    if sender_value:
+                        candidates.append(sender_value)
+                    if sender_domain:
+                        candidates.extend([f'.{sender_domain}', sender_domain])
+                    if recipient_domain:
+                        candidates.extend([f'.{recipient_domain}', recipient_domain])
+                    if sender_domain and recipient_domain:
+                        candidates.extend([
+                            f'.{sender_domain}>@{recipient_domain}',
+                            f'{sender_domain}>@{recipient_domain}'
+                        ])
+
+                    for c in candidates:
+                        store_token(c, ts)
+            except Exception:
+                pass
+
+        return timestamps
 
     def get_whitelist(self):
         """Get list of whitelisted IPs/domains/emails"""
@@ -1832,10 +2902,34 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                                 'raw': line
                             })
 
+            total_items = len(whitelist)
+            page, page_size = self.get_list_pagination(default_page_size=20)
+            pagination_enabled = page is not None and page_size is not None
+
+            if total_items == 0:
+                current_page = 1
+                total_pages = 1
+                paginated = []
+                current_page_size = page_size if pagination_enabled else 0
+            elif pagination_enabled:
+                total_pages = max(1, math.ceil(total_items / page_size))
+                current_page = min(page, total_pages)
+                start = (current_page - 1) * page_size
+                paginated = whitelist[start:start + page_size]
+                current_page_size = page_size
+            else:
+                current_page = 1
+                total_pages = 1
+                paginated = whitelist
+                current_page_size = total_items
+
             self.send_json_response({
                 'success': True,
-                'count': len(whitelist),
-                'whitelist': whitelist
+                'count': total_items,
+                'whitelist': paginated,
+                'page': current_page,
+                'page_size': current_page_size,
+                'total_pages': total_pages
             })
 
         except subprocess.TimeoutExpired:
@@ -2128,9 +3222,18 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
           - 'users': linhas de comandos administrativos/usuários/admin.
           - qualquer outro valor: todas as linhas.
         """
+        # Verificar se está bloqueado
+        if self.is_config_locked():
+            self.send_json_response({
+                'success': False,
+                'error': 'Acesso aos logs está protegido. Remova ou renomeie o arquivo de proteção no servidor.',
+                'locked': True
+            }, 403)
+            return
+
         try:
             today = datetime.utcnow().strftime('%Y-%m-%d')
-            log_dir = '/var/log/spfbl'
+            log_dir = LOG_DIR
             filename = f'spfbl.{today}.log'
             log_path = os.path.join(log_dir, filename)
 
@@ -2221,23 +3324,11 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
     def serve_settings_page(self, status_message=None, status_type=None):
         """Render settings page with SPFBL configuration (server-side)"""
-        config_file = '/opt/spfbl/spfbl.conf'
-        template_path = '/opt/spfbl/web/settings.html'
+        config_file = CONF_FILE
+        template_path = os.path.join(WEB_DIR, 'settings.html')
 
-        # Ler conteúdo do arquivo de configuração
-        try:
-            with open(config_file, 'r', encoding='utf-8', errors='replace') as f:
-                config_content = f.read()
-
-        except Exception as e:
-            config_content = ''
-            if not status_message:
-                status_message = f'Erro ao ler configuração: {str(e)}'
-                status_type = 'error'
-
-        # Definir tipo de status padrão
-        if status_message and not status_type:
-            status_type = 'success'
+        # Verificar PRIMEIRO se a configuração está bloqueada
+        is_locked = self.is_config_locked()
 
         # Carregar template HTML da página de configuração
         try:
@@ -2247,15 +3338,47 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.send_error(500, f'Erro ao carregar template settings.html: {str(e)}')
             return
 
-        # Contagem de linhas e caracteres
-        line_count = config_content.count('\n') + 1 if config_content else 0
-        char_count = len(config_content)
-
         page = template
-        # Substituir placeholders
-        page = page.replace('[[CONFIG_CONTENT]]', config_content)
-        page = page.replace('[[LINE_COUNT]]', str(line_count))
-        page = page.replace('[[CHAR_COUNT]]', str(char_count))
+
+        # Se está bloqueado, não ler nem exibir conteúdo da configuração
+        if is_locked:
+            page = page.replace('[[CONFIG_CONTENT]]', '')
+            page = page.replace('[[LINE_COUNT]]', '0')
+            page = page.replace('[[CHAR_COUNT]]', '0')
+            page = page.replace('[[STATUS_BLOCK]]', '')
+            # Injetar JavaScript para mostrar o alerta
+            locked_js = """<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const configSection = document.getElementById('config');
+    const protectedSection = document.getElementById('protected-section');
+    if (configSection) configSection.classList.remove('active');
+    if (protectedSection) protectedSection.classList.remove('hidden');
+});
+</script>"""
+            page = page.replace('</body>', locked_js + '\n</body>')
+        else:
+            # Só ler e renderizar a configuração se NOT está bloqueada
+            try:
+                with open(config_file, 'r', encoding='utf-8', errors='replace') as f:
+                    config_content = f.read()
+            except Exception as e:
+                config_content = ''
+                if not status_message:
+                    status_message = f'Erro ao ler configuração: {str(e)}'
+                    status_type = 'error'
+
+            # Definir tipo de status padrão
+            if status_message and not status_type:
+                status_type = 'success'
+
+            # Contagem de linhas e caracteres
+            line_count = config_content.count('\n') + 1 if config_content else 0
+            char_count = len(config_content)
+
+            # Substituir placeholders
+            page = page.replace('[[CONFIG_CONTENT]]', config_content)
+            page = page.replace('[[LINE_COUNT]]', str(line_count))
+            page = page.replace('[[CHAR_COUNT]]', str(char_count))
 
 
         # Bloco de status (mensagem de sucesso/erro)
@@ -2287,9 +3410,85 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(page.encode('utf-8', errors='replace'))
 
+    def is_config_locked(self):
+        """Check if configuration is protected by lock file"""
+        return os.path.exists(CONF_LOCK_FILE)
+
+    def check_github_update(self):
+        """Check for updates from GitHub CHANGELOG"""
+        try:
+            import urllib.request
+            changelog_url = (os.environ.get('SPFBL_DASH_CHANGELOG_RAW_URL') or '').strip()
+            changelog_web_url = (os.environ.get('SPFBL_DASH_CHANGELOG_WEB_URL') or '').strip()
+
+            if not changelog_url:
+                self.send_json_response({
+                    'success': False,
+                    'error': 'Update check disabled (configure SPFBL_DASH_CHANGELOG_RAW_URL)',
+                    'update_available': False
+                })
+                return
+
+            # Fetch do GitHub
+            with urllib.request.urlopen(changelog_url, timeout=5) as response:
+                content = response.read().decode('utf-8')
+
+            # Extrair versão usando regex
+            import re
+            match = re.search(r'^##\s+\[v(\d+\.\d+)\]', content, re.MULTILINE)
+            if not match:
+                self.send_json_response({'error': 'Versão não encontrada no CHANGELOG'}, 400)
+                return
+
+            latest_version = match.group(1)
+
+            # Ler versão local
+            try:
+                with open(os.path.join(WEB_DIR, 'version.txt'), 'r') as f:
+                    local_version = f.read().strip()
+                    # Remover 'v' se existir
+                    if local_version.startswith('v'):
+                        local_version = local_version[1:]
+            except:
+                local_version = '0.00'
+
+            # Comparar versões
+            def compare_versions(v1, v2):
+                parts1 = [int(x) for x in v1.split('.')]
+                parts2 = [int(x) for x in v2.split('.')]
+                for i in range(max(len(parts1), len(parts2))):
+                    p1 = parts1[i] if i < len(parts1) else 0
+                    p2 = parts2[i] if i < len(parts2) else 0
+                    if p1 < p2:
+                        return -1
+                    if p1 > p2:
+                        return 1
+                return 0
+
+            comparison = compare_versions(local_version, latest_version)
+
+            self.send_json_response({
+                'success': True,
+                'local_version': local_version,
+                'latest_version': latest_version,
+                'update_available': comparison < 0,
+                'changelog_url': changelog_web_url or changelog_url
+            })
+        except urllib.error.URLError as e:
+            self.send_json_response({
+                'success': False,
+                'error': f'Erro ao conectar ao GitHub: {str(e)}'
+            }, 500)
+        except Exception as e:
+            self.send_json_response({
+                'success': False,
+                'error': f'Erro ao verificar atualização: {str(e)}'
+            }, 500)
+
     def handle_config(self):
         """Get SPFBL configuration file"""
-        config_file = '/opt/spfbl/spfbl.conf'
+        config_file = CONF_FILE
+        is_locked = self.is_config_locked()
 
         try:
             # Ler arquivo preservando UTF-8
@@ -2299,7 +3498,8 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.send_json_response({
                 'success': True,
                 'content': content,
-                'path': config_file
+                'path': config_file,
+                'locked': is_locked
             })
         except Exception as e:
             self.send_json_response({
@@ -2308,7 +3508,15 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
     def handle_config_update(self):
         """Update SPFBL configuration file"""
-        config_file = '/opt/spfbl/spfbl.conf'
+        config_file = CONF_FILE
+
+        # Verificar se configuração está bloqueada
+        if self.is_config_locked():
+            self.send_json_response({
+                'error': 'Configuração protegida: arquivo spfbl.conf.lock existe. Remova o arquivo lock para editar.',
+                'locked': True
+            }, 403)
+            return
 
         try:
             content_length = int(self.headers.get('Content-Length', 0))
@@ -2369,7 +3577,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_length).decode('utf-8', errors='replace')
             params = parse_qs(body)
 
-            config_file = '/opt/spfbl/spfbl.conf'
+            config_file = CONF_FILE
             new_content = params.get('content', [''])[0]
 
             if not new_content.strip():
@@ -2481,13 +3689,21 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         client_ip = self.client_address[0]
         message = f"{client_ip} - {format%args}"
 
-        # Em produção, usar logging apropriado
-        # logging.info(message)
-        pass
+        # Log de acesso habilitado para auditoria
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", file=sys.stderr)
 
 if __name__ == '__main__':
-    PORT = 8002
-    server = HTTPServer(('0.0.0.0', PORT), SPFBLSecureAPIHandler)
+    try:
+        PORT = int(os.environ.get('SPFBL_DASH_PORT', '8002'))
+    except (TypeError, ValueError):
+        PORT = 8002
+
+    # Servidor multi-threaded para suportar múltiplas requisições simultâneas
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+        request_queue_size = 50
+
+    server = ThreadedHTTPServer(('0.0.0.0', PORT), SPFBLSecureAPIHandler)
     print(f"🔒 SPFBL Secure Dashboard running on http://0.0.0.0:{PORT}")
     print(f"   Dashboard: http://0.0.0.0:{PORT}/dashboard.html")
     print(f"   Login: http://0.0.0.0:{PORT}/login")
@@ -2496,4 +3712,6 @@ if __name__ == '__main__':
     print(f"   Session timeout: {SESSION_TIMEOUT}s")
     print(f"   Max login attempts: {MAX_LOGIN_ATTEMPTS}")
     print(f"   Lockout time: {LOCKOUT_TIME}s")
+    print(f"   Server mode: Multi-threaded (max queue: 50)")
+    print(f"   Request timeout: 30s")
     server.serve_forever()

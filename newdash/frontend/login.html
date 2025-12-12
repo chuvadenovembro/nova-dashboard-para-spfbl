@@ -25,12 +25,11 @@
                         id="email"
                         name="email"
                         required
-                        autocomplete="email"
-                        placeholder="usuario@dominio.com"
-                        maxlength="255"
-                        onblur="checkUserStatus(this.value)"
-                    >
-                </div>
+	                        autocomplete="email"
+	                        placeholder="usuario@dominio.com"
+	                        maxlength="255"
+	                    >
+	                </div>
 
                 <div class="form-group">
                     <label for="password">Senha ou código TOTP</label>
@@ -42,10 +41,16 @@
                         autocomplete="current-password"
                         placeholder="Sua senha ou código TOTP (6 dígitos)"
                         maxlength="128"
-                    >
-                </div>
+	                    >
+	                </div>
+	
+	                <div class="first-access-link">
+	                    <button type="button" class="link-button" onclick="openFirstAccessFromLink()">
+	                        Primeiro acesso ou reenviar TOTP
+	                    </button>
+	                </div>
 
-                <div id="error-message" class="error-message" style="display: none;"></div>
+	                <div id="error-message" class="error-message" style="display: none;"></div>
 
                 <button type="submit" id="login-btn" class="login-btn">
                     Entrar
@@ -126,12 +131,12 @@
 
             if (recaptchaWidget) {
                 try {
-                    // Verificar se já foi renderizado
-                    if (recaptchaWidget.innerHTML.trim() === '' || !recaptchaWidget.querySelector('iframe')) {
-                        console.log('reCAPTCHA: Renderizando widget com chave:', RECAPTCHA_SITE_KEY.substring(0, 20) + '...');
-                        grecaptcha.render('recaptcha-widget', {
-                            'sitekey': RECAPTCHA_SITE_KEY
-                        });
+	                    // Verificar se já foi renderizado
+	                    if (recaptchaWidget.innerHTML.trim() === '' || !recaptchaWidget.querySelector('iframe')) {
+	                        console.debug('reCAPTCHA: Renderizando widget');
+	                        grecaptcha.render('recaptcha-widget', {
+	                            'sitekey': RECAPTCHA_SITE_KEY
+	                        });
                         if (recaptchaContainer) {
                             recaptchaContainer.style.display = 'block';
                             console.log('reCAPTCHA: Widget renderizado e visível');
@@ -280,12 +285,23 @@
                 loginBtn.disabled = false;
                 loginBtn.textContent = 'Entrar';
             }
-        }
+	        }
 
-        async function checkUserStatus(email) {
-            if (!email || email.trim() === '') {
-                return;
-            }
+	        function openFirstAccessFromLink() {
+	            const emailInput = document.getElementById('email');
+	            const email = (emailInput?.value || '').trim();
+	            if (!email) {
+	                showError('Informe o email para solicitar o TOTP.');
+	                emailInput?.focus();
+	                return;
+	            }
+	            showFirstAccessForm(email);
+	        }
+
+	        async function checkUserStatus(email) {
+	            if (!email || email.trim() === '') {
+	                return;
+	            }
 
             try {
                 const response = await fetch(`/api/user/check-status?email=${encodeURIComponent(email)}`);

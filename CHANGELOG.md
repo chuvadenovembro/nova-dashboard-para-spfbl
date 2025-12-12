@@ -1,5 +1,23 @@
 # Changelog
 
+## [v0.05] - Listas, segurança e alertas
+
+### Novo
+- Filtro de blacklist por tipo (IP, domínio, email, campanha)
+- Toggle persistente para ativar/desativar envio de e-mails do SPFBL (abuse/TOTP)
+
+### Melhorias
+- Página “Listas (Block/White)” redesenhada e padronizada com “Consultas”, com busca e paginação
+- API/dashboard configuráveis por variáveis de ambiente, sem dados hardcoded
+- Otimizações na leitura de logs/estatísticas e scoping por cliente
+
+### Correções
+- Correção da ordenação/recência dos bloqueios exibidos
+- Login com TOTP compatível com painel legado
+- Restrições de acesso para usuários não-admin
+
+---
+
 ## [v0.04] - Em edição
 
 ### Novo
