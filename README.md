@@ -1,9 +1,6 @@
 # Instalador SPFBL com Nova Dashboard + Integração com o DirectAdmin
 
-<img width="1405" height="943" alt="scrnli_35d47X6ZINCtCo" src="https://github.com/user-attachments/assets/8da57a1e-37cc-4f31-ab38-38c54d0db7aa" />
-
-<img width="1405" height="943" alt="scrnli_cAH95e0P9mI71P" src="https://github.com/user-attachments/assets/65666fd6-f4d1-4e50-bd61-7cb5fc9824ef" />
-
+<img width="1280" height="1622" alt="scrnli_Hb69aS1I58uVR8" src="https://github.com/user-attachments/assets/89a69640-5327-447c-9374-06b78a75da5a" />
 
 
 ## 📋 Visão Geral
