@@ -42,6 +42,10 @@
                     <span class="icon">📋</span>
                     Listas (Block/White)
                 </a>
+                <a href="#addon" class="nav-item is-hidden" id="nav-addon" onclick="showSection('addon', event)" data-label="Addon">
+                    <span class="icon">🧩</span>
+                    Addon
+                </a>
                 <a href="/settings" class="nav-item" data-label="Configurações">
                     <span class="icon">⚙️</span>
                     Configurações
@@ -50,11 +54,7 @@
                     <span class="icon">📜</span>
                     Logs
                 </a>
-                <a href="#subdomain-campaign" class="nav-item" onclick="showSection('subdomain-campaign', event)" data-label="Campanhas de Spam">
-                    <span class="icon">🎯</span>
-                    Campanhas de Spam
-                </a>
-            </nav>
+              </nav>
             <div class="sidebar-footer">
                 <p class="dashboard-version" data-dashboard-version>v0.00</p>
                 <p class="uptime" id="uptime">Carregando...</p>
@@ -97,7 +97,7 @@
                         <canvas id="detailed-stats-chart"></canvas>
                     </div>
                     <div class="chart-card large">
-                        <h3>Bloqueios Diretos do Servidor - Últimas 24 Horas</h3>
+                        <h3 id="spam-hourly-title">Bloqueios Diretos do Servidor - Últimas 24 Horas</h3>
                         <canvas id="spam-hourly-chart"></canvas>
                     </div>
                 </div>
@@ -335,88 +335,88 @@
 
             <!-- Lists Section (Block & White) -->
             <section id="section-lists" class="content-section">
-                <!-- Formulários de Adição Manual -->
-                <div class="add-forms-container">
-                    <div class="add-form-card">
-                        <div class="add-form-header">
-                            <span class="add-form-icon">🚫</span>
-                            <h3>Bloquear Manualmente</h3>
-                        </div>
-                        <div class="add-form-body">
-                            <input
-                                type="text"
-                                id="blocklist-add-input"
-                                class="add-form-input"
-                                placeholder="Digite IP, domínio ou email para bloquear"
-                                autocomplete="off"
-                                onkeypress="if(event.key==='Enter') addToBlocklist()"
-                            />
-	                            <button class="btn btn-danger btn-compact" type="button" onclick="addToBlocklist()">
-	                                🚫 Bloquear
-	                            </button>
-                        </div>
-                    </div>
+                <!-- Filtros elegantes -->
+                <div class="lists-filters">
+                    <input type="text" id="blocklist-search" class="search-input" placeholder="Buscar por IP, domínio, email ou campanha..." autocomplete="off" />
+                    <select id="blocklist-type-select" class="filter-select" onchange="setBlocklistTypeFilter(this.value)">
+                        <option value="all">Todos os tipos</option>
+                        <option value="ip">IPs</option>
+                        <option value="domain">Domínios</option>
+                        <option value="pair">Campanhas</option>
+                        <option value="email">Emails</option>
+                    </select>
+                    <select id="lists-view-select" class="filter-select" onchange="setListsView(this.value)">
+                        <option value="blocklist">Blacklist (Bloqueados)</option>
+                        <option value="whitelist">Whitelist (Permitidos)</option>
+                    </select>
+                </div>
 
-                    <div class="add-form-card">
-                        <div class="add-form-header">
-                            <span class="add-form-icon">✅</span>
-                            <h3>Adicionar à Whitelist</h3>
+                <!-- Painel de controle elegante -->
+                <div class="lists-toolbar">
+                    <div class="lists-control-panel" id="lists-control-panel">
+                        <div class="lists-status-info">
+                            <div class="lists-status-row">
+                                <span class="lists-stats-inline">
+                                    <span><strong id="blocklist-total-count">0</strong> bloqueados</span>
+                                    <span><strong id="whitelist-total-count">0</strong> permitidos</span>
+                                    <span class="lists-selected-count" id="lists-selected-info">Nenhum selecionado</span>
+                                </span>
+                            </div>
+                            <div class="lists-add-inline">
+                                <input
+                                    type="text"
+                                    id="lists-add-input"
+                                    class="lists-add-input"
+                                    placeholder="IP, domínio ou email..."
+                                    autocomplete="off"
+                                    onkeypress="if(event.key==='Enter') addToCurrentList()"
+                                />
+                                <button class="btn btn-danger btn-compact" type="button" onclick="addToBlocklist()">
+                                    Bloquear
+                                </button>
+                                <button class="btn btn-success btn-compact" type="button" onclick="addToWhitelist()">
+                                    Whitelist
+                                </button>
+                            </div>
                         </div>
-                        <div class="add-form-body">
-                            <input
-                                type="text"
-                                id="whitelist-add-input"
-                                class="add-form-input"
-                                placeholder="Digite IP, domínio ou email"
-                                autocomplete="off"
-                                onkeypress="if(event.key==='Enter') addToWhitelist()"
-                            />
-	                            <button class="btn btn-success btn-compact" type="button" onclick="addToWhitelist()">
-	                                ➕ Adicionar
-	                            </button>
+                        <div class="lists-control-buttons">
+                            <label class="lists-select-all-label">
+                                <input type="checkbox" id="lists-select-all" onchange="toggleSelectAllLists()" />
+                                Selecionar todos
+                            </label>
+                            <button class="btn btn-primary btn-compact" type="button" onclick="bulkUnblock()" id="btn-bulk-unblock">
+                                Desbloquear
+                            </button>
+                            <button class="btn btn-success btn-compact" type="button" onclick="bulkUnblockAndWhitelist()" id="btn-bulk-unblock-whitelist">
+                                Desbloquear + Whitelist
+                            </button>
+                            <button class="btn btn-danger btn-compact" type="button" onclick="bulkRemoveWhitelist()" id="btn-bulk-remove-whitelist" style="display:none;">
+                                Remover da Whitelist
+                            </button>
+                            <button class="btn btn-ghost btn-compact" type="button" id="blocklist-search-clear" onclick="clearListsSearch()" disabled>
+                                Limpar busca
+                            </button>
                         </div>
                     </div>
                 </div>
 
-                <!-- Blacklist -->
-                <div class="list-container">
+                <!-- Tabela da Blacklist -->
+                <div class="list-container" id="blocklist-container">
                     <div class="list-header">
                         <div>
-                            <h3>🚫 Blacklist (Bloqueados)</h3>
+                            <h3 id="blocklist-title">Blacklist (Bloqueados)</h3>
                             <span class="list-count" id="blocklist-count">0 itens</span>
-                        </div>
-                        <div class="list-toolbar">
-	                            <label class="inline-row">
-	                                <input type="checkbox" id="blocklist-select-all" onchange="toggleSelectAll('block')" />
-	                                Selecionar todos
-	                            </label>
-	                            <div class="list-filter" id="blocklist-filter" role="group" aria-label="Filtrar blacklist">
-	                                <button type="button" class="btn btn-ghost btn-compact filter-pill active" data-type="all" aria-pressed="true">Todos</button>
-	                                <button type="button" class="btn btn-ghost btn-compact filter-pill" data-type="ip" aria-pressed="false">IPs</button>
-	                                <button type="button" class="btn btn-ghost btn-compact filter-pill" data-type="domain" aria-pressed="false">Domínios</button>
-	                                <button type="button" class="btn btn-ghost btn-compact filter-pill" data-type="pair" aria-pressed="false">Campanhas</button>
-	                                <button type="button" class="btn btn-ghost btn-compact filter-pill" data-type="email" aria-pressed="false">Emails</button>
-	                            </div>
-	                            <div class="list-search">
-	                                <input type="text" id="blocklist-search" class="list-search-input" placeholder="Buscar IP, domínio, email ou campanha" autocomplete="off" />
-	                                <button class="btn btn-ghost btn-compact list-search-clear" type="button" id="blocklist-search-clear" onclick="clearBlocklistSearch()" disabled>Limpar</button>
-	                            </div>
-		                            <div class="btn-group">
-		                                <button class="btn btn-primary btn-compact" type="button" onclick="bulkUnblock()">🔓 Desbloquear</button>
-		                                <button class="btn btn-primary btn-compact" type="button" onclick="bulkUnblockAndWhitelist()">✅ Desbloquear + Whitelist</button>
-	                                <button class="btn btn-green btn-compact" type="button" onclick="bulkWhitelist()">✅ Adicionar à Whitelist</button>
-		                            </div>
                         </div>
                     </div>
                     <div class="table-container">
                         <table class="data-table">
                             <thead>
-	                                <tr>
-	                                    <th style="width:32px;">#</th>
-	                                    <th>Token (IP/Domínio/Email/Campanha)</th>
-	                                    <th>Tipo</th>
-	                                    <th style="width:180px;">Data/Hora</th>
-	                                </tr>
+                                <tr>
+                                    <th style="width:32px;">#</th>
+                                    <th>Token (IP/Domínio/Email/Campanha)</th>
+                                    <th>Tipo</th>
+                                    <th style="width:180px;">Data/Hora</th>
+                                </tr>
                             </thead>
                             <tbody id="blocklist-tbody">
                                 <tr><td colspan="4" class="loading">Carregando blacklist...</td></tr>
@@ -425,29 +425,20 @@
                     </div>
                     <div class="list-footer">
                         <div class="list-pagination">
-                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="blocklist-page-prev" onclick="changeListPage('blocklist', -1)" disabled>◀ Anterior</button>
-                            <span class="page-info" id="blocklist-page-info">Página 1/1</span>
-                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="blocklist-page-next" onclick="changeListPage('blocklist', 1)" disabled>Próxima ▶</button>
+                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="blocklist-page-prev" onclick="changeListPage('blocklist', -1)" disabled>Anterior</button>
+                            <span class="page-info" id="blocklist-page-info">Pagina 1/1</span>
+                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="blocklist-page-next" onclick="changeListPage('blocklist', 1)" disabled>Proxima</button>
                         </div>
                         <div class="list-status" id="blocklist-status"></div>
                     </div>
                 </div>
 
-                <!-- Whitelist -->
-                <div class="list-container">
+                <!-- Tabela da Whitelist (oculta por padrão) -->
+                <div class="list-container" id="whitelist-container" style="display:none;">
                     <div class="list-header">
                         <div>
-                            <h3>✅ Whitelist (Permitidos)</h3>
+                            <h3 id="whitelist-title">Whitelist (Permitidos)</h3>
                             <span class="list-count" id="whitelist-count">0 itens</span>
-                        </div>
-                        <div class="list-toolbar">
-                            <label class="inline-row">
-                                <input type="checkbox" id="whitelist-select-all" onchange="toggleSelectAll('white')" />
-                                Selecionar todos
-                            </label>
-	                            <div class="btn-group">
-	                                <button class="btn btn-danger btn-compact" type="button" onclick="bulkRemoveWhitelist()">🗑️ Remover da Whitelist</button>
-	                            </div>
                         </div>
                     </div>
                     <div class="table-container">
@@ -466,14 +457,131 @@
                     </div>
                     <div class="list-footer">
                         <div class="list-pagination">
-                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="whitelist-page-prev" onclick="changeListPage('whitelist', -1)" disabled>◀ Anterior</button>
-                            <span class="page-info" id="whitelist-page-info">Página 1/1</span>
-                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="whitelist-page-next" onclick="changeListPage('whitelist', 1)" disabled>Próxima ▶</button>
+                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="whitelist-page-prev" onclick="changeListPage('whitelist', -1)" disabled>Anterior</button>
+                            <span class="page-info" id="whitelist-page-info">Pagina 1/1</span>
+                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="whitelist-page-next" onclick="changeListPage('whitelist', 1)" disabled>Proxima</button>
                         </div>
                         <div class="list-status" id="whitelist-status"></div>
                     </div>
                 </div>
             </section>
+
+            <!-- Addon Section -->
+            <section id="section-addon" class="content-section is-hidden">
+                <!-- Filtros elegantes igual Consultas -->
+                <div class="addon-filters">
+                    <input type="text" id="addon-report-search" class="search-input" placeholder="Buscar por domínio, host ou IP..." autocomplete="off" />
+                    <select id="addon-category-select" class="filter-select" onchange="setAddonReportCategoryFromSelect(this.value)">
+                        <option value="domains">Domínios de Alto Risco</option>
+                        <option value="hosts">Hosts Suspeitos</option>
+                        <option value="ips">IPs Associados</option>
+                    </select>
+                </div>
+
+                <!-- Painel de controle elegante igual Consultas -->
+                <div class="addon-toolbar">
+                    <div class="addon-control-panel" id="addon-control-panel">
+                        <div class="addon-status-info" id="addon-status-info">
+                            <div class="addon-status-row">
+                                <span class="addon-status-badge" id="addon-status-badge">Carregando...</span>
+                                <span class="addon-status-meta" id="addon-config-summary">--</span>
+                            </div>
+                            <div class="addon-stats-inline">
+                                <span><strong id="addon-domains-count">0</strong> domínios</span>
+                                <span><strong id="addon-hosts-count">0</strong> hosts</span>
+                                <span><strong id="addon-ips-count">0</strong> IPs</span>
+                                <span class="addon-report-meta" id="addon-report-meta">--</span>
+                            </div>
+                        </div>
+                        <div class="addon-control-buttons">
+                            <button class="btn btn-primary btn-compact" type="button" onclick="refreshAddonReport(true)">
+                                Atualizar
+                            </button>
+                            <button class="btn btn-ghost btn-compact" type="button" onclick="resetAddonSimulation()" title="Zerar histórico de simulação do addon">
+                                Resetar simulação
+                            </button>
+                            <button class="btn btn-ghost btn-compact" type="button" id="addon-report-search-clear" onclick="clearAddonSearch()" disabled>
+                                Limpar busca
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tabela do relatório -->
+                <div class="list-container">
+                    <div class="list-header">
+                        <div>
+                            <h3 id="addon-table-title">Domínios de Alto Risco</h3>
+                            <span class="list-count" id="addon-list-count">0 itens</span>
+                        </div>
+                    </div>
+	                    <div class="table-container">
+	                        <table class="data-table" id="addon-report-table">
+	                            <thead id="addon-report-thead">
+	                                <tr>
+	                                    <th>Carregando...</th>
+	                                </tr>
+	                            </thead>
+	                            <tbody id="addon-report-tbody">
+	                                <tr><td class="loading">Carregando relatório do addon...</td></tr>
+	                            </tbody>
+	                        </table>
+	                    </div>
+	                    <div class="list-footer">
+	                        <div class="list-pagination">
+	                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="addon-report-page-prev" onclick="changeListPage('addon-report', -1)" disabled>◀ Anterior</button>
+	                            <span class="page-info" id="addon-report-page-info">Página 1/1</span>
+	                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="addon-report-page-next" onclick="changeListPage('addon-report', 1)" disabled>Próxima ▶</button>
+	                        </div>
+	                        <div class="list-status" id="addon-report-status"></div>
+	                    </div>
+	                </div>
+	
+	                <div class="list-container">
+	                    <div class="list-header">
+	                        <div>
+                            <h3>Whitelist do Addon</h3>
+                            <span class="list-count" id="addon-whitelist-count">0 itens</span>
+                        </div>
+                        <div class="list-toolbar">
+                            <div class="list-search">
+                                <input
+                                    type="text"
+                                    id="addon-whitelist-input"
+                                    class="list-search-input"
+                                    placeholder="Adicionar domínio na whitelist"
+                                    autocomplete="off"
+                                    onkeypress="if(event.key==='Enter') addAddonWhitelistDomain()"
+                                />
+                                <button class="btn btn-success btn-compact" type="button" onclick="addAddonWhitelistDomain()">
+                                    ➕ Adicionar
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+	                    <div class="table-container">
+	                        <table class="data-table">
+	                            <thead>
+	                                <tr>
+	                                    <th>Domínio</th>
+	                                    <th style="width:140px;">Ações</th>
+	                                </tr>
+	                            </thead>
+	                            <tbody id="addon-whitelist-tbody">
+	                                <tr><td colspan="2" class="loading">Carregando whitelist...</td></tr>
+	                            </tbody>
+	                        </table>
+	                    </div>
+	                    <div class="list-footer">
+	                        <div class="list-pagination">
+	                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="addon-whitelist-page-prev" onclick="changeListPage('addon-whitelist', -1)" disabled>◀ Anterior</button>
+	                            <span class="page-info" id="addon-whitelist-page-info">Página 1/1</span>
+	                            <button class="btn btn-ghost btn-compact list-page-btn" type="button" id="addon-whitelist-page-next" onclick="changeListPage('addon-whitelist', 1)" disabled>Próxima ▶</button>
+	                        </div>
+	                        <div class="list-status" id="addon-whitelist-status"></div>
+	                    </div>
+	                </div>
+	            </section>
 
             <!-- Logs Section -->
             <section id="section-logs" class="content-section">
@@ -513,228 +621,7 @@
                 </div>
             </section>
 
-            <!-- Subdomain Campaign Blocker Section -->
-            <section id="section-subdomain-campaign" class="content-section">
-                <div class="addon-header">
-                    <div class="addon-header-info">
-                        <h3>🎯 Bloqueador de Campanhas de Spam por Subdomínios</h3>
-                        <p class="muted">Detecta e bloqueia automaticamente campanhas de spam que usam múltiplos subdomínios do mesmo domínio base com padrões numéricos.</p>
-                        <div class="addon-pill-row">
-                            <span class="addon-pill">Detecção de Padrões</span>
-                            <span class="addon-pill">Multi-Critério</span>
-                            <span class="addon-pill">Wildcard Blocking</span>
-                        </div>
-                    </div>
-                    <div class="addon-header-actions">
-                        <button class="btn btn-primary btn-compact" type="button" onclick="saveSubdomainCampaignConfig()">💾 Salvar configuração</button>
-                        <button id="subdomain-campaign-scan-button" class="btn btn-primary btn-compact" type="button" onclick="runSubdomainCampaignScan(true)">▶️ Executar análise</button>
-                    </div>
-                </div>
-
-                <!-- Status Card -->
-                <div class="addon-card addon-status-card-full">
-                    <div class="addon-card-header">
-                        <span class="addon-card-title">📊 Status do Sistema</span>
-                    </div>
-                    <p id="subdomain-campaign-status" class="addon-status-text">Carregando configuração...</p>
-                </div>
-
-                <!-- Abas de Navegação -->
-                <div class="addon-tabs">
-                    <button class="addon-tab-btn active" onclick="switchSubdomainCampaignTab('report', event)">📊 Campanhas Detectadas</button>
-                    <button class="addon-tab-btn" onclick="switchSubdomainCampaignTab('autoblock', event)">🚨 Bloqueio Automático</button>
-                    <button class="addon-tab-btn" onclick="switchSubdomainCampaignTab('config', event)">⚙️ Configuração</button>
-                </div>
-
-                <!-- Aba: Campanhas Detectadas -->
-                <div id="subdomain-campaign-tab-report" class="addon-tab-content active">
-                    <div class="addon-tab-grid">
-                        <div class="addon-card addon-card-full">
-                            <div class="addon-card-header">
-                                <span class="addon-card-title">🎯 Campanhas de Alto Risco</span>
-                                <button class="btn btn-ghost btn-sm" type="button" onclick="toggleSubdomainCampaignDetails()">
-                                    <span id="subdomain-campaign-toggle-icon">▼</span> Detalhes
-                                </button>
-                            </div>
-                            <div id="subdomain-campaign-summary" class="addon-summary"></div>
-                            <div id="subdomain-campaign-details" class="addon-report-details" style="display: none;">
-                                <div class="addon-card-header" style="margin-top: 1rem;">
-                                    <span class="addon-card-title">🔍 Detalhamento Completo das Campanhas</span>
-                                </div>
-                                <textarea id="subdomain-campaign-results" class="addon-results-textarea" readonly rows="15" placeholder="Execute uma análise para ver as campanhas detectadas..."></textarea>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Aba: Bloqueio Automático -->
-                <div id="subdomain-campaign-tab-autoblock" class="addon-tab-content">
-                    <div class="addon-tab-grid">
-                        <!-- Card 1: Automação Principal -->
-                        <div class="addon-card addon-card-full">
-                            <div class="addon-card-header">
-                                <span class="addon-card-title">🤖 Configuração de Automação</span>
-                            </div>
-                            <div class="addon-form-stack">
-                                <label class="inline-row checkbox-large">
-                                    <input type="checkbox" id="subdomain-campaign-enabled" />
-                                    <span><strong>Habilitar Detector de Campanhas</strong></span>
-                                </label>
-                                <p class="section-help">🔍 Ativa a varredura contínua em busca de campanhas de spam por subdomínios.</p>
-
-                                <label class="inline-row checkbox-large">
-                                    <input type="checkbox" id="subdomain-campaign-auto-block" />
-                                    <span><strong>Ativar Bloqueio Automático</strong></span>
-                                </label>
-                                <p class="section-help">⚡ Quando ativado, bloqueia automaticamente domínios base (wildcard) de campanhas detectadas.</p>
-
-                                <label class="inline-row">
-                                    <input type="checkbox" id="subdomain-campaign-dry-run" />
-                                    <span><strong>Modo Simulação (Dry Run)</strong></span>
-                                </label>
-                                <p class="section-help">🧪 Apenas simula bloqueios sem executá-los. Recomendado para testes iniciais.</p>
-                            </div>
-                        </div>
-
-                        <!-- Card 2: Risk Scoring -->
-                        <div class="addon-card addon-card-full">
-                            <div class="addon-card-header">
-                                <span class="addon-card-title">🎯 Sistema de Pontuação de Risco</span>
-                            </div>
-                            <div class="addon-form-stack">
-                                <div class="addon-slider-block">
-                                    <div class="addon-slider-header">
-                                        <label for="subdomain-campaign-risk-threshold">Limiar de Bloqueio (Risk Score 0-100)</label>
-                                        <span id="subdomain-campaign-risk-threshold-value" class="addon-slider-value">70</span>
-                                    </div>
-                                    <input type="range" id="subdomain-campaign-risk-threshold" min="30" max="100" step="5" value="70" class="slider">
-                                    <div class="addon-slider-meta">
-                                        <span>Mais Agressivo</span>
-                                        <span>Mais Conservador</span>
-                                    </div>
-                                    <p class="section-help">💡 <strong>Recomendado: 70</strong> (balanceado) • 80 (conservador) • 60 (agressivo)</p>
-                                </div>
-                                <div class="addon-info-box">
-                                    <strong>🧮 Critérios de Pontuação:</strong>
-                                    <ul style="margin: 0.5rem 0 0 1.2rem; font-size: 0.9em;">
-                                        <li><strong>Padrão Numérico</strong> (0-35 pts) - Subdomínios com números (ex: doc123)</li>
-                                        <li><strong>Quantidade de Subdomínios</strong> (0-25 pts) - Múltiplos subdomínios</li>
-                                        <li><strong>Taxa PASS</strong> (0-20 pts) - Spam passando SPF</li>
-                                        <li><strong>Velocidade</strong> (0-15 pts) - Eventos por hora</li>
-                                        <li><strong>Botnet</strong> (0-10 pts) - Múltiplos IPs diferentes</li>
-                                    </ul>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Card 3: Ação de Bloqueio -->
-                        <div class="addon-card addon-card-full">
-                            <div class="addon-card-header">
-                                <span class="addon-card-title">🛡️ Tipo de Bloqueio</span>
-                            </div>
-                            <div class="addon-form-stack">
-                                <label class="inline-row">
-                                    <input type="radio" name="block-action" id="subdomain-campaign-block-action-block" value="block" />
-                                    <span><strong>Block</strong> - Bloqueia domínio com wildcard (.dominio.com)</span>
-                                </label>
-                                <label class="inline-row">
-                                    <input type="radio" name="block-action" id="subdomain-campaign-block-action-superblock" value="superblock" checked />
-                                    <span><strong>Superblock</strong> - Bloqueio mais restritivo (recomendado)</span>
-                                </label>
-                                <p class="section-help">⚠️ Superblock é mais agressivo e bloqueia de forma mais abrangente. Use para campanhas persistentes.</p>
-                            </div>
-                        </div>
-
-                        <!-- Card 4: Log de Ações -->
-                        <div class="addon-card addon-card-full">
-                            <div class="addon-card-header">
-                                <span class="addon-card-title">📋 Histórico de Bloqueios</span>
-                            </div>
-                            <textarea id="subdomain-campaign-actions" class="addon-actions-log-textarea" readonly rows="10" placeholder="Nenhuma ação executada ainda. Os bloqueios aparecerão aqui..."></textarea>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Aba: Configuração -->
-                <div id="subdomain-campaign-tab-config" class="addon-tab-content">
-                    <div class="addon-tab-grid">
-                        <!-- Card 1: Parâmetros de Detecção -->
-                        <div class="addon-card addon-card-full">
-                            <div class="addon-card-header">
-                                <span class="addon-card-title">🔍 Parâmetros de Detecção</span>
-                            </div>
-                            <div class="addon-form-grid">
-                                <div class="addon-form-field">
-                                    <label for="subdomain-campaign-window">📅 Janela de Análise (horas)</label>
-                                    <input type="number" id="subdomain-campaign-window" min="1" max="72" class="search-input" value="6">
-                                    <small class="field-hint">Padrão: 6h (detecção rápida de ataques)</small>
-                                </div>
-                                <div class="addon-form-field">
-                                    <label for="subdomain-campaign-min-subdomains">🎯 Mínimo de Subdomínios</label>
-                                    <input type="number" id="subdomain-campaign-min-subdomains" min="2" max="20" class="search-input" value="3">
-                                    <small class="field-hint">Mínimo de subdomínios para considerar campanha</small>
-                                </div>
-                                <div class="addon-form-field">
-                                    <label for="subdomain-campaign-min-events">🔢 Mínimo de Eventos</label>
-                                    <input type="number" id="subdomain-campaign-min-events" min="5" max="1000" class="search-input" value="10">
-                                    <small class="field-hint">Eventos mínimos por domínio base</small>
-                                </div>
-                                <div class="addon-form-field">
-                                    <label for="subdomain-campaign-poll">⏱️ Intervalo de Scan (segundos)</label>
-                                    <input type="number" id="subdomain-campaign-poll" min="30" max="3600" class="search-input" value="60">
-                                    <small class="field-hint">Frequência da varredura automática</small>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Card 2: Whitelist -->
-                        <div class="addon-card addon-card-full">
-                            <div class="addon-card-header">
-                                <span class="addon-card-title">🛡️ Whitelist (Domínios Protegidos)</span>
-                            </div>
-                            <div class="addon-form-stack">
-                                <label for="subdomain-campaign-whitelist">Domínios que nunca serão bloqueados</label>
-                                <textarea id="subdomain-campaign-whitelist" class="search-input" rows="4" placeholder="Ex.: cliente-importante.com&#10;parceiro.com.br&#10;dominio-confiavel.net&#10;(um por linha ou separado por vírgula)"></textarea>
-                                <p class="section-help">🛡️ Domínios listados aqui serão ignorados pelo detector, mesmo que apresentem padrões suspeitos.</p>
-                                <div class="addon-info-box">
-                                    <strong>ℹ️ Whitelist Automática:</strong>
-                                    <p style="margin: 0.3rem 0 0 0; font-size: 0.9em;">
-                                        O sistema já ignora automaticamente serviços conhecidos como sendgrid.net, amazonses.com, mailgun.org, hubspotemail.net, e outros.
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Card 3: Exemplos de Detecção -->
-                        <div class="addon-card addon-card-full">
-                            <div class="addon-card-header">
-                                <span class="addon-card-title">📚 Exemplos de Campanhas Detectadas</span>
-                            </div>
-                            <div class="addon-info-box">
-                                <strong>🎯 Padrões Típicos de Spam:</strong>
-                                <div style="margin-top: 0.5rem; font-family: monospace; font-size: 0.85em;">
-                                    <div style="margin-bottom: 0.5rem;">
-                                        <strong>Campanha "pagarfacil":</strong><br>
-                                        → docfiscal160.pagarfacilbrasil.com<br>
-                                        → docfiscal183.pagarfacilgo.com<br>
-                                        → docfiscal137.pagarfacilaqui.com
-                                    </div>
-                                    <div>
-                                        <strong>Campanha "frutagostosa":</strong><br>
-                                        → relatorios05e.acaisolteirofrutagostosa.sbs<br>
-                                        → relatorios10j.abiufrutagostosa.sbs<br>
-                                        → relatorios13m.acaifrutagostosa.sbs
-                                    </div>
-                                </div>
-                                <p style="margin: 0.8rem 0 0 0; font-size: 0.9em;">
-                                    ✅ <strong>Características comuns:</strong> Prefixo comum + número + domínio base variável
-                                </p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </section>
-        </main>
+          </main>
     </div>
 
     <!-- Modal Adicionar Servidor -->

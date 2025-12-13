@@ -51,6 +51,14 @@ FRAUD_TOKEN_FILE = os.environ.get(
 )
 MAX_FRAUD_EVENTS = 500
 
+# Cache para relatório do addon (evita reprocessamento frequente)
+ADDON_REPORT_CACHE = {
+    'data': None,
+    'timestamp': 0,
+    'ttl': 30  # 30 segundos de cache
+}
+ADDON_REPORT_CACHE_LOCK = threading.Lock()
+
 # Backup persistente para toggle de SMTP/alerts
 SMTP_BACKUP_FILE = os.environ.get(
     'SPFBL_SMTP_BACKUP_FILE',
@@ -96,18 +104,7 @@ update_cache = {'checked_at': 0.0, 'payload': None}
 update_cache_lock = threading.Lock()
 
 # Addons (caminho único, relativo à instalação)
-SUBDOMAIN_CAMPAIGN_SERVICE = None
-
-if ADDON_PATH not in sys.path:
-    sys.path.append(ADDON_PATH)
-
-try:
-    from subdomain_campaign_blocker import SubdomainCampaignBlockerService
-    SUBDOMAIN_CAMPAIGN_SERVICE = SubdomainCampaignBlockerService()
-    SUBDOMAIN_CAMPAIGN_SERVICE.start_auto_runner()
-    print("[INFO] Subdomain Campaign Blocker carregado e iniciado", file=sys.stderr)
-except Exception as e:
-    print(f"[ERROR] Falha ao carregar Subdomain Campaign Blocker em {ADDON_PATH}: {e}", file=sys.stderr)
+# Nenhum addon carregado no momento
 
 # Armazenamento em memória (dicionários simples, sem chave secreta global)
 sessions = {}  # {token: {'email': 'user@domain', 'created': timestamp}}
@@ -344,8 +341,9 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             '/api/settings/smtp-status',
             '/api/server/memory',
             '/api/fraud-events',
-            '/api/addon/subdomain-campaign/config',
-            '/api/addon/subdomain-campaign/scan',
+            '/api/addons',
+            '/api/addons/subdomain-campaign/report',
+            '/api/addons/subdomain-campaign/whitelist',
         }
         if path in admin_only_get:
             if not self.require_admin():
@@ -388,10 +386,12 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.get_spam_block_stats()
         elif path == '/api/stats/spam-blocks/hourly':
             self.get_spam_blocks_hourly()
-        elif path == '/api/addon/subdomain-campaign/config':
-            self.handle_subdomain_campaign_config_get()
-        elif path == '/api/addon/subdomain-campaign/scan':
-            self.handle_subdomain_campaign_scan()
+        elif path == '/api/addons':
+            self.get_addons()
+        elif path == '/api/addons/subdomain-campaign/report':
+            self.get_subdomain_campaign_report()
+        elif path == '/api/addons/subdomain-campaign/whitelist':
+            self.get_subdomain_campaign_whitelist()
         elif path == '/api/settings/config':
             self.handle_config()
         # Serve static files / dynamic settings page
@@ -421,13 +421,6 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.handle_fraud_event_report()
         elif path == '/api/logout':
             self.handle_logout()
-        elif path == '/api/addon/subdomain-campaign/config':
-            if not self.is_authenticated():
-                self.send_json_response({'error': 'Unauthorized'}, 401)
-                return
-            if not self.require_admin():
-                return
-            self.handle_subdomain_campaign_config_post()
         elif path == '/api/clients/add':
             if not self.is_authenticated():
                 self.send_json_response({'error': 'Unauthorized'}, 401)
@@ -523,6 +516,20 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 self.send_json_response({'error': 'Unauthorized'}, 401)
                 return
             self.get_server_memory()
+        elif path == '/api/addons/subdomain-campaign/whitelist':
+            if not self.is_authenticated():
+                self.send_json_response({'error': 'Unauthorized'}, 401)
+                return
+            if not self.require_admin():
+                return
+            self.handle_subdomain_campaign_whitelist()
+        elif path == '/api/addons/subdomain-campaign/reset-simulation':
+            if not self.is_authenticated():
+                self.send_json_response({'error': 'Unauthorized'}, 401)
+                return
+            if not self.require_admin():
+                return
+            self.reset_subdomain_campaign_simulation()
         else:
             self.send_error(404, "Not found")
 
@@ -2077,50 +2084,447 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json_response({'error': str(e), 'success': False}, 500)
 
-    # --- Subdomain Campaign Blocker Addon ---
-    def handle_subdomain_campaign_config_get(self):
-        if not SUBDOMAIN_CAMPAIGN_SERVICE:
-            self.send_json_response({'success': False, 'error': 'Subdomain Campaign Blocker não disponível'}, 500)
-            return
+    def get_addons(self):
+        """Lista addons disponíveis e status básico."""
         try:
-            self.send_json_response({'success': True, 'config': SUBDOMAIN_CAMPAIGN_SERVICE.config})
+            cfg_path, cfg = self._load_subdomain_campaign_addon_config()
+            addon_present = os.path.isdir(ADDON_PATH)
+            log_path = os.path.join(LOG_DIR, 'addon-subdomain-campaign.log')
+            whitelist_path = os.path.join(ADDON_PATH, 'whitelist.csv')
+
+            addons = [
+                {
+                    'id': 'subdomain_campaign_blocker',
+                    'name': 'Subdomain Campaign Blocker',
+                    'available': bool(addon_present),
+                    'enabled': bool(cfg.get('enabled', False)),
+                    'dry_run': bool(cfg.get('dry_run', True)),
+                    'config_path': cfg_path,
+                    'log_path': log_path,
+                    'whitelist_path': whitelist_path,
+                }
+            ]
+
+            self.send_json_response({
+                'success': True,
+                'addons_path': ADDON_PATH,
+                'folder_exists': bool(addon_present),
+                'addons': addons
+            })
         except Exception as e:
             self.send_json_response({'success': False, 'error': str(e)}, 500)
 
-    def handle_subdomain_campaign_config_post(self):
-        if not SUBDOMAIN_CAMPAIGN_SERVICE:
-            self.send_json_response({'success': False, 'error': 'Subdomain Campaign Blocker não disponível'}, 500)
-            return
+    def _subdomain_campaign_whitelist_csv_path(self):
+        return os.path.join(ADDON_PATH, 'whitelist.csv')
+
+    def _normalize_whitelist_domain(self, token):
+        value = (token or '').strip().lower()
+        if not value:
+            return None
+        value = value.split(',', 1)[0].strip()
+        value = value.lstrip('.').rstrip('.')
+        if not value or '@' in value or ' ' in value or '/' in value:
+            return None
+        if self._looks_like_ip_or_cidr(value):
+            return None
+        # Domínio simples (pelo menos 1 ponto)
+        if '.' not in value:
+            return None
+        if not re.fullmatch(r'[a-z0-9.-]{1,253}', value):
+            return None
+        return value
+
+    def _load_subdomain_campaign_whitelist_csv(self):
+        entries = set()
+        path = self._subdomain_campaign_whitelist_csv_path()
+        if not os.path.exists(path):
+            return entries
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
+                for raw in fh:
+                    line = (raw or '').strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    d = self._normalize_whitelist_domain(line)
+                    if d:
+                        entries.add(d)
+        except Exception:
+            pass
+        return entries
+
+    def _write_subdomain_campaign_whitelist_csv(self, entries):
+        path = self._subdomain_campaign_whitelist_csv_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+        tmp = f'{path}.tmp'
+        ordered = sorted(set(entries or set()))
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            for item in ordered:
+                fh.write(f'{item}\n')
+        os.replace(tmp, path)
+        return ordered
+
+    def _is_domain_whitelisted(self, domain, whitelist_set):
+        d = (domain or '').strip().lower().lstrip('.').rstrip('.')
+        if not d:
+            return False
+        if d in whitelist_set or f'.{d}' in whitelist_set:
+            return True
+        parts = d.split('.')
+        for i in range(len(parts)):
+            parent = '.'.join(parts[i:])
+            if parent in whitelist_set or f'.{parent}' in whitelist_set:
+                return True
+        return False
+
+    def get_subdomain_campaign_whitelist(self):
+        """Retorna a whitelist local do addon (CSV)."""
+        try:
+            if not os.path.isdir(ADDON_PATH):
+                self.send_json_response({
+                    'success': True,
+                    'available': False,
+                    'addons_path': ADDON_PATH
+                })
+                return
+
+            path = self._subdomain_campaign_whitelist_csv_path()
+            entries = sorted(self._load_subdomain_campaign_whitelist_csv())
+            total_items = len(entries)
+
+            page, page_size = self.get_list_pagination(default_page_size=20)
+            pagination_enabled = page is not None and page_size is not None
+
+            if total_items == 0:
+                current_page = 1
+                total_pages = 1
+                paginated = []
+                current_page_size = page_size if pagination_enabled else 0
+            elif pagination_enabled:
+                total_pages = max(1, math.ceil(total_items / page_size))
+                current_page = min(page, total_pages)
+                start = (current_page - 1) * page_size
+                paginated = entries[start:start + page_size]
+                current_page_size = page_size
+            else:
+                current_page = 1
+                total_pages = 1
+                paginated = entries
+                current_page_size = total_items
+
+            self.send_json_response({
+                'success': True,
+                'available': True,
+                'path': path,
+                'count': total_items,
+                'whitelist': paginated,
+                'page': current_page,
+                'page_size': current_page_size,
+                'total_pages': total_pages,
+            })
+        except Exception as e:
+            self.send_json_response({'success': False, 'error': str(e)}, 500)
+
+    def handle_subdomain_campaign_whitelist(self):
+        """Adiciona/remove um domínio da whitelist local do addon (CSV)."""
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            raw = self.rfile.read(content_length).decode('utf-8', errors='replace') if content_length > 0 else ''
-            data = json.loads(raw) if raw else {}
-        except Exception as e:
-            self.send_json_response({'success': False, 'error': f'JSON inválido: {str(e)}'}, 400)
-            return
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8') or '{}')
 
-        try:
-            new_cfg = SUBDOMAIN_CAMPAIGN_SERVICE.update_config(data or {})
-            self.send_json_response({'success': True, 'config': new_cfg})
+            action = (data.get('action') or '').strip().lower()
+            token = data.get('domain') or data.get('token') or ''
+            domain = self._normalize_whitelist_domain(token)
+
+            if action not in {'add', 'remove', 'delete', 'drop'}:
+                self.send_json_response({'success': False, 'error': 'Ação inválida (use add/remove).'}, 400)
+                return
+            if not domain:
+                self.send_json_response({'success': False, 'error': 'Domínio inválido.'}, 400)
+                return
+
+            entries = self._load_subdomain_campaign_whitelist_csv()
+            before = len(entries)
+
+            if action == 'add':
+                entries.add(domain)
+                changed = len(entries) != before
+            else:
+                # remove / delete / drop
+                if domain in entries:
+                    entries.remove(domain)
+                    changed = True
+                else:
+                    changed = False
+
+            ordered = self._write_subdomain_campaign_whitelist_csv(entries)
+            self.send_json_response({
+                'success': True,
+                'action': 'add' if action == 'add' else 'remove',
+                'domain': domain,
+                'changed': changed,
+                'count': len(ordered),
+                'whitelist': ordered
+            })
+        except json.JSONDecodeError:
+            self.send_json_response({'success': False, 'error': 'JSON inválido'}, 400)
         except Exception as e:
             self.send_json_response({'success': False, 'error': str(e)}, 500)
 
-    def handle_subdomain_campaign_scan(self):
-        if not SUBDOMAIN_CAMPAIGN_SERVICE:
-            self.send_json_response({'success': False, 'error': 'Subdomain Campaign Blocker não disponível'}, 500)
-            return
+    def _subdomain_campaign_simulation_reset_path(self):
+        return os.path.join(ADDON_PATH, 'config', 'subdomain_campaign_simulation_reset.json')
+
+    def _load_subdomain_campaign_simulation_reset_at(self):
+        path = self._subdomain_campaign_simulation_reset_path()
+        if not os.path.exists(path):
+            return None
         try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                payload = json.load(fh) or {}
+            ts_text = (payload.get('reset_at') or '').strip()
+            if not ts_text:
+                return None
+            ts = datetime.fromisoformat(ts_text)
+            if ts.tzinfo is None:
+                ts = ts.astimezone()
+            else:
+                ts = ts.astimezone()
+            return ts
+        except Exception:
+            return None
+
+    def reset_subdomain_campaign_simulation(self):
+        """Reseta o baseline da simulação (zera contagem histórica do addon no dashboard)."""
+        try:
+            session_email = self._get_session_email()
+            now = datetime.now().astimezone()
+            path = self._subdomain_campaign_simulation_reset_path()
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            except Exception:
+                pass
+            payload = {
+                'reset_at': now.isoformat(),
+                'reset_by': session_email,
+            }
+            tmp = f'{path}.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            os.replace(tmp, path)
+            self.send_json_response({
+                'success': True,
+                'reset_at': now.isoformat(),
+                'path': path
+            })
+        except Exception as e:
+            self.send_json_response({'success': False, 'error': str(e)}, 500)
+
+    def get_subdomain_campaign_report(self):
+        """Relatório do addon de campanhas por subdomínios (domínios, hosts e IPs).
+
+        Usa cache de 30 segundos para evitar reprocessamento frequente dos logs.
+        """
+        try:
+            if not os.path.isdir(ADDON_PATH):
+                self.send_json_response({
+                    'success': True,
+                    'available': False,
+                    'addons_path': ADDON_PATH
+                })
+                return
+
+            now_ts = time.time()
+
+            # Verifica cache
+            with ADDON_REPORT_CACHE_LOCK:
+                cache_valid = (
+                    ADDON_REPORT_CACHE['data'] is not None and
+                    (now_ts - ADDON_REPORT_CACHE['timestamp']) < ADDON_REPORT_CACHE['ttl']
+                )
+                if cache_valid:
+                    self.send_json_response(ADDON_REPORT_CACHE['data'])
+                    return
+
+            # Cache expirado ou inexistente - gera novo relatório
+            cfg_path, cfg = self._load_subdomain_campaign_addon_config()
+
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
-            mode = (params.get('mode') or ['view'])[0]
-            auto_block = mode == 'block'
 
-            result = SUBDOMAIN_CAMPAIGN_SERVICE.scan(auto_block=auto_block)
-            status = 200 if result.get('success') else 400
-            self.send_json_response(result, status)
+            def get_int(name, default, min_value=None, max_value=None):
+                raw = (params.get(name) or [str(default)])[0]
+                try:
+                    value = int(raw)
+                except Exception:
+                    value = int(default)
+                if min_value is not None:
+                    value = max(min_value, value)
+                if max_value is not None:
+                    value = min(max_value, value)
+                return value
+
+            max_domains = get_int('max_domains', 200, 10, 1000)
+            max_hosts = get_int('max_hosts', 500, 10, 5000)
+            max_ips = get_int('max_ips', 500, 10, 5000)
+
+            window_hours = int(cfg.get('window_hours', 6) or 6)
+            min_subdomains = int(cfg.get('min_subdomains', 3) or 3)
+            min_events = int(cfg.get('min_events_per_domain', 10) or 10)
+            min_clients = int(cfg.get('min_clients', 1) or 1)
+            risk_threshold = int(cfg.get('risk_score_threshold', 70) or 70)
+            max_lines = int(cfg.get('max_lines_per_scan', 200000) or 200000)
+
+            now = datetime.now().astimezone()
+            start_time = now - timedelta(hours=window_hours)
+
+            addon_stats = self._calculate_subdomain_campaign_addon_window(start_time, now)
+            whitelist_set = self._load_subdomain_campaign_whitelist_csv()
+
+            analysis_error = None
+            domains = []
+            host_agg = {}
+            ip_agg = {}
+
+            try:
+                if ADDON_PATH not in sys.path:
+                    sys.path.insert(0, ADDON_PATH)
+                from subdomain_pattern_analyzer import analyze_subdomain_patterns
+
+                campaigns = analyze_subdomain_patterns(
+                    window_hours=window_hours,
+                    min_subdomains=min_subdomains,
+                    min_events_per_domain=min_events,
+                    min_clients=min_clients,
+                    max_lines=max_lines,
+                    verbose=False,
+                )
+
+                high_risk = [c for c in campaigns if int(getattr(c, 'risk_score', 0) or 0) >= risk_threshold]
+                high_risk.sort(key=lambda c: int(getattr(c, 'risk_score', 0) or 0), reverse=True)
+
+                for c in high_risk[:max_domains]:
+                    base_domain = getattr(c, 'base_domain', '')
+                    whitelisted = self._is_domain_whitelisted(base_domain, whitelist_set) if whitelist_set else False
+                    domains.append({
+                        'base_domain': base_domain,
+                        'risk_score': int(getattr(c, 'risk_score', 0) or 0),
+                        'unique_subdomains': int(getattr(c, 'unique_subdomains', 0) or 0),
+                        'total_events': int(getattr(c, 'total_events', 0) or 0),
+                        'unique_ips': int(getattr(c, 'unique_ips', 0) or 0),
+                        'unique_clients': int(getattr(c, 'unique_clients', 0) or 0),
+                        'events_per_hour': float(getattr(c, 'events_per_hour', 0.0) or 0.0),
+                        'pattern_ratio': float(getattr(c, 'pattern_ratio', 0.0) or 0.0),
+                        'pass_ratio': float(getattr(c, 'pass_ratio', 0.0) or 0.0),
+                        'recommended_action': getattr(c, 'recommended_action', ''),
+                        'whitelisted': bool(whitelisted),
+                        'risk_factors': list(getattr(c, 'risk_factors', []) or []),
+                        'top_hosts': [d.get('full_domain') for d in (getattr(c, 'subdomain_details', []) or [])[:5] if d.get('full_domain')],
+                        'top_ips': list((getattr(c, 'top_ips', []) or [])[:5]),
+                    })
+
+                    for d in (getattr(c, 'subdomain_details', []) or []):
+                        full_domain = d.get('full_domain')
+                        if not full_domain:
+                            continue
+                        entry = host_agg.get(full_domain)
+                        if not entry:
+                            host_agg[full_domain] = {
+                                'full_domain': full_domain,
+                                'base_domain': base_domain,
+                                'subdomain': d.get('subdomain'),
+                                'count': int(d.get('count', 0) or 0),
+                                'unique_ips': int(d.get('unique_ips', 0) or 0),
+                                'unique_clients': int(d.get('unique_clients', 0) or 0),
+                                'has_pattern': bool(d.get('has_pattern', False)),
+                                'pattern': d.get('pattern'),
+                                'first_seen': d.get('first_seen'),
+                                'last_seen': d.get('last_seen'),
+                            }
+                        else:
+                            entry['count'] += int(d.get('count', 0) or 0)
+
+                    for ip_info in (getattr(c, 'top_ips', []) or []):
+                        ip_value = (ip_info.get('ip') or '').strip()
+                        if not ip_value:
+                            continue
+                        entry = ip_agg.get(ip_value)
+                        if not entry:
+                            ip_agg[ip_value] = {
+                                'ip': ip_value,
+                                'count': int(ip_info.get('count', 0) or 0),
+                                'domains': {base_domain} if base_domain else set(),
+                            }
+                        else:
+                            entry['count'] += int(ip_info.get('count', 0) or 0)
+                            if base_domain:
+                                entry['domains'].add(base_domain)
+
+            except Exception as e:
+                analysis_error = str(e)
+
+            hosts = list(host_agg.values())
+            hosts.sort(key=lambda x: int(x.get('count', 0) or 0), reverse=True)
+            hosts = hosts[:max_hosts]
+
+            ips = []
+            for v in ip_agg.values():
+                ips.append({
+                    'ip': v.get('ip'),
+                    'count': int(v.get('count', 0) or 0),
+                    'domains': sorted(list(v.get('domains') or [])),
+                })
+            ips.sort(key=lambda x: int(x.get('count', 0) or 0), reverse=True)
+            ips = ips[:max_ips]
+
+            response_data = {
+                'success': True,
+                'available': True,
+                'generated_at': now.isoformat(),
+                'cached': False,
+                'window': {
+                    'start': start_time.isoformat(),
+                    'end': now.isoformat(),
+                    'hours': window_hours,
+                },
+                'config': {
+                    'path': cfg_path,
+                    'enabled': bool(cfg.get('enabled', False)),
+                    'dry_run': bool(cfg.get('dry_run', True)),
+                    'auto_block_enabled': bool(cfg.get('auto_block_enabled', False)),
+                    'block_action': cfg.get('block_action', 'superblock'),
+                    'block_ips': bool(cfg.get('block_ips', False)),
+                    'min_clients': min_clients,
+                    'min_subdomains': min_subdomains,
+                    'min_events_per_domain': min_events,
+                    'risk_score_threshold': risk_threshold,
+                    'max_lines_per_scan': max_lines,
+                },
+                'addon_stats': addon_stats,
+                'report': {
+                    'domains': domains,
+                    'hosts': hosts,
+                    'ips': ips,
+                    'counts': {
+                        'domains': len(domains),
+                        'hosts': len(hosts),
+                        'ips': len(ips),
+                    }
+                },
+                'analysis_error': analysis_error,
+            }
+
+            # Atualiza cache
+            with ADDON_REPORT_CACHE_LOCK:
+                ADDON_REPORT_CACHE['data'] = response_data
+                ADDON_REPORT_CACHE['timestamp'] = time.time()
+
+            self.send_json_response(response_data)
         except Exception as e:
             self.send_json_response({'success': False, 'error': str(e)}, 500)
 
+    
     # --- Helpers para estatísticas de SPAM (bloqueios diretos) ---
     def _iter_spfbl_logs(self, start_time, end_time):
         """
@@ -2162,6 +2566,250 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 return datetime.strptime(ts_text, '%Y-%m-%dT%H:%M:%S%z')
             except Exception:
                 return None
+
+    def _read_last_lines(self, path, max_lines=20000, timeout=5):
+        """Lê as últimas N linhas de um arquivo de forma eficiente."""
+        try:
+            result = subprocess.run(
+                ['tail', f'-{int(max_lines)}', path],
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            if result.stdout:
+                return result.stdout.splitlines()
+        except Exception:
+            pass
+
+        try:
+            from collections import deque
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                return list(deque(f, int(max_lines)))
+        except Exception:
+            return []
+
+    def _parse_addon_timestamp(self, line):
+        """Extrai datetime (timezone-aware) de uma linha de log de addon."""
+        if not line:
+            return None
+        parts = line.split(' ', 1)
+        if not parts:
+            return None
+        ts_text = parts[0].strip()
+        if not ts_text:
+            return None
+        try:
+            ts = datetime.fromisoformat(ts_text)
+            if ts.tzinfo is None:
+                # Assume timezone local
+                ts = ts.astimezone()
+            else:
+                ts = ts.astimezone()
+            return ts
+        except Exception:
+            return None
+
+    def _load_subdomain_campaign_addon_config(self):
+        """Carrega config do addon subdomain_campaign_blocker (se existir)."""
+        cfg_path = os.path.join(ADDON_PATH, 'config', 'subdomain_campaign_blocker.json')
+        cfg = {}
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path, 'r', encoding='utf-8') as fh:
+                    cfg = json.load(fh) or {}
+            except Exception:
+                cfg = {}
+        return cfg_path, cfg
+
+    def _calculate_subdomain_campaign_addon_window(self, start_time, end_time, max_lines=20000):
+        """
+        Extrai estatísticas do addon (subdomain_campaign_blocker) em uma janela.
+
+        - domain_blocked: quantidade de domínios-base únicos (ex: .example.com)
+        - ip_blocked: quantidade de IPs únicos bloqueados pelo addon
+        - host_blocked: soma de subdomínios (subdomains=) por domínio-base na janela
+
+        Retorna também séries separadas para dry-run vs bloqueio real.
+        """
+        log_path = os.path.join(LOG_DIR, 'addon-subdomain-campaign.log')
+        cfg_path, cfg = self._load_subdomain_campaign_addon_config()
+
+        addon_present = os.path.isdir(ADDON_PATH)
+        addon_enabled = bool(cfg.get('enabled', False))
+        addon_dry_run = bool(cfg.get('dry_run', True))
+        reset_at = self._load_subdomain_campaign_simulation_reset_at()
+        baseline = start_time
+        if reset_at and reset_at > baseline:
+            baseline = reset_at
+
+        result = {
+            'available': bool(addon_present),
+            'enabled': addon_enabled,
+            'dry_run': addon_dry_run,
+            'log_path': log_path,
+            'config_path': cfg_path,
+            'reset_at': reset_at.isoformat() if reset_at else None,
+            'blocked': {'host_blocked': 0, 'domain_blocked': 0, 'ip_blocked': 0},
+            'dry_run_events': {'host_blocked': 0, 'domain_blocked': 0, 'ip_blocked': 0},
+            'effective': {'host_blocked': 0, 'domain_blocked': 0, 'ip_blocked': 0},
+        }
+
+        if not os.path.exists(log_path):
+            return result
+
+        domain_action_re = re.compile(r'\b(?P<kind>DRY_RUN|BLOCKED)\s+\[(?P<action>SUPERBLOCK|BLOCK)\]\s+(?P<token>\.[A-Za-z0-9.-]+)\b')
+        ip_dry_re = re.compile(r'\bDRY_RUN\s+\[BLOCK\]\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\b')
+        ip_blocked_re = re.compile(r'\bBLOCKED\s+\[IP\]\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\b')
+        subdomains_re = re.compile(r'\bsubdomains=(\d+)\b')
+
+        blocked_domains = {}  # base_domain -> max(subdomains)
+        dry_domains = {}
+        blocked_ips = set()
+        dry_ips = set()
+
+        for line in self._read_last_lines(log_path, max_lines=max_lines, timeout=5):
+            ts = self._parse_addon_timestamp(line)
+            if not ts or ts < baseline or ts > end_time:
+                continue
+
+            m_dom = domain_action_re.search(line)
+            if m_dom:
+                token = (m_dom.group('token') or '').strip()
+                base = token.lstrip('.').lower()
+                sub_count = 0
+                sm = subdomains_re.search(line)
+                if sm:
+                    try:
+                        sub_count = int(sm.group(1))
+                    except Exception:
+                        sub_count = 0
+                bucket = blocked_domains if m_dom.group('kind') == 'BLOCKED' else dry_domains
+                prev = bucket.get(base, 0)
+                if sub_count > prev:
+                    bucket[base] = sub_count
+                elif base not in bucket:
+                    bucket[base] = prev
+                continue
+
+            m_ip = ip_blocked_re.search(line)
+            if m_ip:
+                blocked_ips.add(m_ip.group('ip'))
+                continue
+
+            m_ip_dry = ip_dry_re.search(line)
+            if m_ip_dry:
+                dry_ips.add(m_ip_dry.group('ip'))
+
+        blocked_counts = {
+            'domain_blocked': len(blocked_domains),
+            'ip_blocked': len(blocked_ips),
+            'host_blocked': sum(blocked_domains.values()),
+        }
+        dry_counts = {
+            'domain_blocked': len(dry_domains),
+            'ip_blocked': len(dry_ips),
+            'host_blocked': sum(dry_domains.values()),
+        }
+
+        effective = dry_counts if addon_dry_run else blocked_counts
+
+        result['blocked'] = blocked_counts
+        result['dry_run_events'] = dry_counts
+        result['effective'] = effective
+        return result
+
+    def _calculate_subdomain_campaign_addon_today(self, day, max_lines=20000):
+        """Calcula séries por hora (0-23) do addon para um dia específico."""
+        log_path = os.path.join(LOG_DIR, 'addon-subdomain-campaign.log')
+        cfg_path, cfg = self._load_subdomain_campaign_addon_config()
+
+        addon_present = os.path.isdir(ADDON_PATH)
+        addon_enabled = bool(cfg.get('enabled', False))
+        addon_dry_run = bool(cfg.get('dry_run', True))
+        reset_at = self._load_subdomain_campaign_simulation_reset_at()
+
+        result = {
+            'available': bool(addon_present),
+            'enabled': addon_enabled,
+            'dry_run': addon_dry_run,
+            'log_path': log_path,
+            'config_path': cfg_path,
+            'reset_at': reset_at.isoformat() if reset_at else None,
+            'blocked': {'host_blocked': [0] * 24, 'domain_blocked': [0] * 24, 'ip_blocked': [0] * 24},
+            'dry_run_events': {'host_blocked': [0] * 24, 'domain_blocked': [0] * 24, 'ip_blocked': [0] * 24},
+            'effective': {'host_blocked': [0] * 24, 'domain_blocked': [0] * 24, 'ip_blocked': [0] * 24},
+        }
+
+        if not os.path.exists(log_path):
+            return result
+
+        domain_action_re = re.compile(r'\b(?P<kind>DRY_RUN|BLOCKED)\s+\[(?P<action>SUPERBLOCK|BLOCK)\]\s+(?P<token>\.[A-Za-z0-9.-]+)\b')
+        ip_dry_re = re.compile(r'\bDRY_RUN\s+\[BLOCK\]\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\b')
+        ip_blocked_re = re.compile(r'\bBLOCKED\s+\[IP\]\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\b')
+        subdomains_re = re.compile(r'\bsubdomains=(\d+)\b')
+
+        # Para deduplicar por hora
+        blocked_domains_by_hour = [dict() for _ in range(24)]  # base -> max subdomains
+        dry_domains_by_hour = [dict() for _ in range(24)]
+        blocked_ips_by_hour = [set() for _ in range(24)]
+        dry_ips_by_hour = [set() for _ in range(24)]
+
+        for line in self._read_last_lines(log_path, max_lines=max_lines, timeout=5):
+            ts = self._parse_addon_timestamp(line)
+            if not ts:
+                continue
+            if ts.date() != day:
+                continue
+            if reset_at and ts < reset_at:
+                continue
+            hour = ts.hour
+            if hour < 0 or hour > 23:
+                continue
+
+            m_dom = domain_action_re.search(line)
+            if m_dom:
+                token = (m_dom.group('token') or '').strip()
+                base = token.lstrip('.').lower()
+                sub_count = 0
+                sm = subdomains_re.search(line)
+                if sm:
+                    try:
+                        sub_count = int(sm.group(1))
+                    except Exception:
+                        sub_count = 0
+                bucket = blocked_domains_by_hour[hour] if m_dom.group('kind') == 'BLOCKED' else dry_domains_by_hour[hour]
+                prev = bucket.get(base, 0)
+                if sub_count > prev:
+                    bucket[base] = sub_count
+                elif base not in bucket:
+                    bucket[base] = prev
+                continue
+
+            m_ip = ip_blocked_re.search(line)
+            if m_ip:
+                blocked_ips_by_hour[hour].add(m_ip.group('ip'))
+                continue
+
+            m_ip_dry = ip_dry_re.search(line)
+            if m_ip_dry:
+                dry_ips_by_hour[hour].add(m_ip_dry.group('ip'))
+
+        blocked_series = {
+            'domain_blocked': [len(blocked_domains_by_hour[h]) for h in range(24)],
+            'ip_blocked': [len(blocked_ips_by_hour[h]) for h in range(24)],
+            'host_blocked': [sum(blocked_domains_by_hour[h].values()) for h in range(24)],
+        }
+        dry_series = {
+            'domain_blocked': [len(dry_domains_by_hour[h]) for h in range(24)],
+            'ip_blocked': [len(dry_ips_by_hour[h]) for h in range(24)],
+            'host_blocked': [sum(dry_domains_by_hour[h].values()) for h in range(24)],
+        }
+        effective = dry_series if addon_dry_run else blocked_series
+
+        result['blocked'] = blocked_series
+        result['dry_run_events'] = dry_series
+        result['effective'] = effective
+        return result
 
     def _calculate_spam_blocks(self, window_hours=24, by_hour=False, allowed_networks=None):
         """
@@ -2244,10 +2892,29 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         host_bloqueado_count = sum(1 for domains in domains_por_ip.values() if len(domains) == 1)
         domain_bloqueado_count = sum(1 for ips in ips_por_domain.values() if len(ips) > 1)
 
-        result = {
+        direct_summary = {
             'host_blocked': host_bloqueado_count,
             'domain_blocked': domain_bloqueado_count,
             'ip_blocked': total_blocked,
+        }
+
+        # Addon: só expõe agregados globais em sessão "unrestricted" (admin)
+        addon_summary = None
+        if allowed_networks is None:
+            addon_summary = self._calculate_subdomain_campaign_addon_window(start_time, end_time)
+            effective = addon_summary.get('effective') or {}
+            combined_summary = {
+                'host_blocked': direct_summary['host_blocked'] + int(effective.get('host_blocked', 0) or 0),
+                'domain_blocked': direct_summary['domain_blocked'] + int(effective.get('domain_blocked', 0) or 0),
+                'ip_blocked': direct_summary['ip_blocked'] + int(effective.get('ip_blocked', 0) or 0),
+            }
+        else:
+            combined_summary = direct_summary
+
+        result = {
+            **combined_summary,
+            'direct': direct_summary,
+            'addon': addon_summary,
             'success': True,
             'window_start': start_time.isoformat(),
             'window_end': end_time.isoformat()
@@ -2374,12 +3041,29 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             domain_series.append(domain_count)
             ip_series.append(stats['ip_blocked'])
 
-        return {
-            'hours': list(range(24)),
-            'labels': [f'{h}:00' for h in range(24)],
+        direct_series = {
             'host_blocked': host_series,
             'domain_blocked': domain_series,
             'ip_blocked': ip_series,
+        }
+
+        addon_series = None
+        combined = direct_series
+        if allowed_networks is None:
+            addon_series = self._calculate_subdomain_campaign_addon_today(datetime.now().date())
+            effective = addon_series.get('effective') or {}
+            combined = {
+                'host_blocked': [direct_series['host_blocked'][h] + int((effective.get('host_blocked') or [0]*24)[h] or 0) for h in range(24)],
+                'domain_blocked': [direct_series['domain_blocked'][h] + int((effective.get('domain_blocked') or [0]*24)[h] or 0) for h in range(24)],
+                'ip_blocked': [direct_series['ip_blocked'][h] + int((effective.get('ip_blocked') or [0]*24)[h] or 0) for h in range(24)],
+            }
+
+        return {
+            'hours': list(range(24)),
+            'labels': [f'{h}:00' for h in range(24)],
+            **combined,
+            'direct': direct_series,
+            'addon': addon_series,
             'success': True
         }
 
@@ -2743,7 +3427,6 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         # Lista apenas logs de addons (não logs principais do SPFBL para performance)
         addon_logs = [
             os.path.join(LOG_DIR, 'addon-tld.log'),
-            os.path.join(LOG_DIR, 'addon-subdomain-campaign.log'),
         ]
 
         for log_path in addon_logs:
@@ -2760,7 +3443,6 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 )
 
                 for line in result.stdout.split('\n'):
-                    # Formato addon-subdomain-campaign: "2025-11-28T09:02:13.881378 BLOCKED [SUPERBLOCK] .domain"
                     # Formato addon-tld: "2025-11-25T20:17:01.160091 BLOCK[IP] 179.209.47.218"
                     parts = line.split()
                     if len(parts) < 3:
@@ -2771,11 +3453,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
                     # Detecta formato e extrai token
                     token = None
-                    if 'BLOCKED' in line and '[' in line:
-                        # Formato: BLOCKED [SUPERBLOCK] .domain
-                        if len(parts) >= 3:
-                            token = parts[2]  # .domain
-                    elif 'BLOCK[' in line:
+                    if 'BLOCK[' in line:
                         # Formato: BLOCK[IP] token
                         if len(parts) >= 3:
                             token = parts[2]
@@ -3713,6 +4391,39 @@ document.addEventListener('DOMContentLoaded', function() {
         # Log de acesso habilitado para auditoria
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", file=sys.stderr)
 
+def _start_subdomain_campaign_auto_runner():
+    """Inicia o auto-runner do addon de campanhas por subdomínio (se habilitado)."""
+    try:
+        if not os.path.isdir(ADDON_PATH):
+            return None
+
+        blocker_path = os.path.join(ADDON_PATH, 'subdomain_campaign_blocker.py')
+        if not os.path.isfile(blocker_path):
+            return None
+
+        # Adiciona addon ao path se necessário
+        if ADDON_PATH not in sys.path:
+            sys.path.insert(0, ADDON_PATH)
+
+        from subdomain_campaign_blocker import SubdomainCampaignBlockerService
+
+        service = SubdomainCampaignBlockerService()
+
+        # Só inicia o auto-runner se o addon estiver enabled E auto_block_enabled
+        if service.config.get('enabled') and service.config.get('auto_block_enabled'):
+            service.start_auto_runner()
+            print(f"   Subdomain Campaign Blocker: AUTO-RUNNER STARTED (poll: {service.config.get('poll_seconds', 60)}s)")
+            return service
+        else:
+            enabled = service.config.get('enabled', False)
+            auto_block = service.config.get('auto_block_enabled', False)
+            print(f"   Subdomain Campaign Blocker: DISABLED (enabled={enabled}, auto_block={auto_block})")
+            return None
+    except Exception as e:
+        print(f"   Subdomain Campaign Blocker: ERROR - {e}", file=sys.stderr)
+        return None
+
+
 if __name__ == '__main__':
     try:
         PORT = int(os.environ.get('SPFBL_DASH_PORT', '8002'))
@@ -3735,4 +4446,8 @@ if __name__ == '__main__':
     print(f"   Lockout time: {LOCKOUT_TIME}s")
     print(f"   Server mode: Multi-threaded (max queue: 50)")
     print(f"   Request timeout: 30s")
+
+    # Inicia o auto-runner do addon de campanhas por subdomínio
+    subdomain_campaign_service = _start_subdomain_campaign_auto_runner()
+
     server.serve_forever()
