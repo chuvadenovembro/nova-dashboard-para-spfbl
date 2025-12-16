@@ -1,13 +1,21 @@
 # Changelog
 
-## [v0.06] - Correção crítica de segurança na autenticação (2025-12-15)
+## [v0.06] - Correção de segurança, melhorias e otimizações (2025-12-15)
 
 ### Melhorias
 - Detecção mais robusta de página de login do painel legado com marcadores negativos adicionais
+- Página "Listas de Bloqueio" agora exibe todos os tipos de bloqueio (IPs, domínios, hosts)
+- Extração de timestamps agora inclui logs do addon subdomain-campaign
+- **Otimização de performance**: Cache de 60s para lista de bloqueios
+- **Otimização de performance**: Cache de 5min para timestamps de bloqueios
+- **Otimização de performance**: Busca de timestamps apenas para itens filtrados (não toda a lista)
+- **Otimização de performance**: Leitura reduzida de logs (5000 linhas addon, 10000 linhas SPFBL)
 
 ### Correções
 - Correção crítica: Fallback perigoso na autenticação que permitia acesso sem senha correta
 - Validação restritiva do HTML de resposta do painel legado (apenas marcadores positivos reconhecidos)
+- API de bloqueios alterada de `block show` para `block show all` para exibir todos os bloqueios
+- Correção na ordenação de bloqueios: timestamps agora são buscados para todos os itens (não apenas primeiros 200)
 
 ---
 

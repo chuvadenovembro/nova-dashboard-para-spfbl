@@ -59,6 +59,17 @@ ADDON_REPORT_CACHE = {
 }
 ADDON_REPORT_CACHE_LOCK = threading.Lock()
 
+# Cache para lista de bloqueios (otimização de performance)
+BLOCKLIST_CACHE = {
+    'data': None,           # Lista completa de bloqueios (sem timestamps)
+    'timestamps': {},       # Cache de timestamps por token
+    'list_timestamp': 0,    # Quando a lista foi atualizada
+    'ts_timestamp': 0,      # Quando os timestamps foram atualizados
+    'list_ttl': 60,         # TTL da lista: 60 segundos
+    'ts_ttl': 300,          # TTL dos timestamps: 5 minutos
+}
+BLOCKLIST_CACHE_LOCK = threading.Lock()
+
 # Backup persistente para toggle de SMTP/alerts
 SMTP_BACKUP_FILE = os.environ.get(
     'SPFBL_SMTP_BACKUP_FILE',
@@ -3317,11 +3328,21 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             display = display[1:]
         return token_type, display
 
-    def get_blocklist(self):
-        """Get list of blocked IPs/domains/emails"""
+    def _get_cached_blocklist(self):
+        """Retorna lista de bloqueios do cache ou atualiza se expirado."""
+        global BLOCKLIST_CACHE
+        now = time.time()
+
+        with BLOCKLIST_CACHE_LOCK:
+            # Verifica se o cache da lista ainda é válido
+            if (BLOCKLIST_CACHE['data'] is not None and
+                now - BLOCKLIST_CACHE['list_timestamp'] < BLOCKLIST_CACHE['list_ttl']):
+                return BLOCKLIST_CACHE['data']
+
+        # Cache expirado, buscar nova lista
         try:
             result = subprocess.run(
-                ['/sbin/spfbl', 'block', 'show'],
+                ['/sbin/spfbl', 'block', 'show', 'all'],
                 capture_output=True,
                 text=True,
                 timeout=10
@@ -3331,34 +3352,167 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             output = result.stdout.strip()
 
             if output:
-                raw_tokens = []
                 for line in output.split('\n'):
                     line = line.strip()
                     if line and not line.startswith('#'):
-                        # Formato típico: CIDR=... ou .dominio ou email
                         parts = line.split()
                         if parts:
                             raw_token = parts[0]
-                            raw_tokens.append(raw_token)
+                            type_token, display_token = self._detect_block_token_type(raw_token)
+                            blocklist.append({
+                                'token': display_token,
+                                'type': type_token,
+                                'raw': raw_token,
+                            })
 
-                known_tokens = set()
-                for rt in raw_tokens:
-                    known_tokens.update(self._block_token_variants(rt))
+            with BLOCKLIST_CACHE_LOCK:
+                BLOCKLIST_CACHE['data'] = blocklist
+                BLOCKLIST_CACHE['list_timestamp'] = now
 
-                timestamps = self.get_block_timestamps_from_logs(known_tokens=known_tokens)
+            return blocklist
 
-                for raw_token in raw_tokens:
-                    type_token, display_token = self._detect_block_token_type(raw_token)
-                    variants = self._block_token_variants(raw_token)
-                    ts_candidates = [timestamps.get(v) for v in variants if timestamps.get(v)]
-                    timestamp = max(ts_candidates) if ts_candidates else None
-                    blocklist.append({
-                        'token': display_token,
-                        'type': type_token,
-                        'raw': raw_token,
-                        'timestamp': timestamp
-                    })
+        except Exception:
+            # Em caso de erro, retorna cache antigo se disponível
+            with BLOCKLIST_CACHE_LOCK:
+                if BLOCKLIST_CACHE['data'] is not None:
+                    return BLOCKLIST_CACHE['data']
+            return []
 
+    def _get_timestamps_for_tokens(self, tokens):
+        """Busca timestamps apenas para tokens específicos, usando cache."""
+        global BLOCKLIST_CACHE
+        now = time.time()
+        result = {}
+
+        # Verificar quais tokens já estão no cache
+        tokens_to_fetch = []
+        with BLOCKLIST_CACHE_LOCK:
+            cached_ts = BLOCKLIST_CACHE['timestamps']
+            ts_fresh = now - BLOCKLIST_CACHE['ts_timestamp'] < BLOCKLIST_CACHE['ts_ttl']
+
+            for item in tokens:
+                raw = item.get('raw', '')
+                if ts_fresh and raw in cached_ts:
+                    result[raw] = cached_ts[raw]
+                else:
+                    tokens_to_fetch.append(item)
+
+        # Se todos os tokens já estão no cache, retornar
+        if not tokens_to_fetch:
+            return result
+
+        # Buscar timestamps apenas para tokens não cacheados
+        known_tokens = set()
+        for item in tokens_to_fetch:
+            known_tokens.update(self._block_token_variants(item.get('raw', '')))
+
+        # Busca otimizada de timestamps (apenas logs recentes)
+        new_timestamps = self._get_block_timestamps_fast(known_tokens)
+
+        # Associar timestamps aos tokens
+        for item in tokens_to_fetch:
+            raw = item.get('raw', '')
+            variants = self._block_token_variants(raw)
+            ts_candidates = [new_timestamps.get(v) for v in variants if new_timestamps.get(v)]
+            ts = max(ts_candidates) if ts_candidates else None
+            result[raw] = ts
+
+        # Atualizar cache
+        with BLOCKLIST_CACHE_LOCK:
+            BLOCKLIST_CACHE['timestamps'].update(result)
+            BLOCKLIST_CACHE['ts_timestamp'] = now
+
+        return result
+
+    def _get_block_timestamps_fast(self, known_tokens):
+        """Versão otimizada da busca de timestamps - lê menos linhas."""
+        timestamps = {}
+
+        def store_token(token, ts):
+            if not token or not ts:
+                return
+            variants = self._block_token_variants(token)
+            if known_tokens is not None and variants.isdisjoint(known_tokens):
+                return
+            for v in variants:
+                prev = timestamps.get(v)
+                if not prev or ts > prev:
+                    timestamps[v] = ts
+
+        # Apenas logs de addons (mais relevantes e menores)
+        addon_logs = [
+            os.path.join(LOG_DIR, 'addon-tld.log'),
+            os.path.join(LOG_DIR, 'addon-subdomain-campaign.log'),
+        ]
+
+        for log_path in addon_logs:
+            if not os.path.exists(log_path):
+                continue
+            try:
+                # Lê apenas últimas 5000 linhas para performance
+                result = subprocess.run(
+                    ['tail', '-5000', log_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=3
+                )
+                for line in result.stdout.split('\n'):
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    ts = parts[0]
+                    token = None
+                    if 'BLOCK[' in line and len(parts) >= 3:
+                        token = parts[2]
+                    elif 'BLOCKED [' in line and len(parts) >= 4:
+                        token = parts[3]
+                    if token:
+                        store_token(token, ts)
+            except Exception:
+                pass
+
+        # Log principal SPFBL - apenas último dia, menos linhas
+        today = datetime.now().strftime('%Y-%m-%d')
+        main_log = os.path.join(LOG_DIR, f"spfbl.{today}.log")
+        if os.path.exists(main_log):
+            try:
+                result = subprocess.run(
+                    ['tail', '-10000', main_log],
+                    capture_output=True,
+                    text=True,
+                    timeout=3
+                )
+                for line in result.stdout.split('\n'):
+                    if not re.search(r'=>\s*(BLOCKED|BANNED)\b', line):
+                        continue
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    ts = parts[0]
+                    spf_pos = line.find(' SPF ')
+                    quote_source = line[spf_pos:] if spf_pos != -1 else line
+                    quoted = re.findall(r"'([^']*)'", quote_source)
+                    if len(quoted) >= 1:
+                        ip_value = quoted[0].strip()
+                        if ip_value and self._looks_like_ip_or_cidr(ip_value):
+                            store_token(f'CIDR={ip_value}/32', ts)
+                            store_token(ip_value, ts)
+                    if len(quoted) >= 3:
+                        helo = quoted[2].strip()
+                        if helo and '.' in helo and not self._looks_like_ip_or_cidr(helo):
+                            store_token(f'.{helo.lower()}', ts)
+            except Exception:
+                pass
+
+        return timestamps
+
+    def get_blocklist(self):
+        """Get list of blocked IPs/domains/emails - versão otimizada com cache"""
+        try:
+            # 1. Obter lista do cache (rápido)
+            blocklist = self._get_cached_blocklist()
+
+            # 2. Parsear parâmetros de filtro/paginação
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)
             search_term = (params.get('search') or [''])[0].strip()
@@ -3367,6 +3521,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             if type_filter not in allowed_types:
                 type_filter = 'all'
 
+            # 3. Aplicar filtros ANTES de buscar timestamps
             if search_term:
                 search_lower = search_term.lower()
                 filtered_list = [
@@ -3374,15 +3529,10 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                     if search_lower in item['token'].lower() or search_lower in item.get('raw', '').lower()
                 ]
             else:
-                filtered_list = blocklist
+                filtered_list = list(blocklist)
 
             if type_filter != 'all':
                 filtered_list = [item for item in filtered_list if item.get('type') == type_filter]
-
-            # Ordena por timestamp (mais recente primeiro) de forma otimizada
-            # Itens sem timestamp (None or '') vão para o final
-            # Ordenação em ordem decrescente: timestamps maiores (mais recentes) primeiro
-            filtered_list.sort(key=lambda x: x.get('timestamp') or '', reverse=True)
 
             total_all = len(blocklist)
             total_items = len(filtered_list)
@@ -3390,11 +3540,32 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             pagination_enabled = page is not None and page_size is not None
 
             if total_items == 0:
-                current_page = 1
-                total_pages = 1
-                paginated = []
-                current_page_size = page_size if pagination_enabled else 0
-            elif pagination_enabled:
+                self.send_json_response({
+                    'success': True,
+                    'count': 0,
+                    'total_all': total_all,
+                    'search': search_term,
+                    'type': type_filter,
+                    'blocklist': [],
+                    'page': 1,
+                    'page_size': page_size if pagination_enabled else 0,
+                    'total_pages': 1
+                })
+                return
+
+            # 4. Buscar timestamps para TODOS os itens filtrados
+            # O cache de timestamps (5min TTL) garante performance em requisições subsequentes
+            timestamps_map = self._get_timestamps_for_tokens(filtered_list)
+
+            # 5. Adicionar timestamps aos itens
+            for item in filtered_list:
+                item['timestamp'] = timestamps_map.get(item.get('raw', ''))
+
+            # 6. Ordenar por timestamp (mais recente primeiro)
+            filtered_list.sort(key=lambda x: x.get('timestamp') or '', reverse=True)
+
+            # 7. Paginar
+            if pagination_enabled:
                 total_pages = max(1, math.ceil(total_items / page_size))
                 current_page = min(page, total_pages)
                 start = (current_page - 1) * page_size
@@ -3442,9 +3613,10 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 if not prev or ts > prev:
                     timestamps[v] = ts
 
-        # Lista apenas logs de addons (não logs principais do SPFBL para performance)
+        # Lista logs de addons (não logs principais do SPFBL para performance)
         addon_logs = [
             os.path.join(LOG_DIR, 'addon-tld.log'),
+            os.path.join(LOG_DIR, 'addon-subdomain-campaign.log'),
         ]
 
         for log_path in addon_logs:
@@ -3461,7 +3633,6 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 )
 
                 for line in result.stdout.split('\n'):
-                    # Formato addon-tld: "2025-11-25T20:17:01.160091 BLOCK[IP] 179.209.47.218"
                     parts = line.split()
                     if len(parts) < 3:
                         continue
@@ -3471,10 +3642,15 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
                     # Detecta formato e extrai token
                     token = None
-                    if 'BLOCK[' in line:
-                        # Formato: BLOCK[IP] token
-                        if len(parts) >= 3:
-                            token = parts[2]
+
+                    # Formato addon-tld: "2025-11-25T20:17:01 BLOCK[IP] 179.209.47.218"
+                    if 'BLOCK[' in line and len(parts) >= 3:
+                        token = parts[2]
+
+                    # Formato addon-subdomain-campaign: "2025-12-15T16:16:24 BLOCKED [SUPERBLOCK] .dominio score=..."
+                    # ou: "2025-12-15T16:40:01 BLOCKED [IP] 46.16.15.47 count=..."
+                    elif 'BLOCKED [' in line and len(parts) >= 4:
+                        token = parts[3]
 
                     if not token or not ts:
                         continue
