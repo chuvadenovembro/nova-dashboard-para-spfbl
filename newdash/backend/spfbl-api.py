@@ -1386,20 +1386,38 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         return self._verify_legacy_otp_login(base_url, email_path, password)
 
     def _is_legacy_authenticated_html(self, html_text):
+        """Verifica se o HTML retornado indica autenticação bem-sucedida.
+
+        SEGURANÇA: Esta função deve ser RESTRITIVA - só retorna True
+        se encontrar marcadores POSITIVOS de autenticação.
+        Nunca usar fallback permissivo!
+        """
         if not html_text:
             return False
         html_lower = html_text.lower()
-        # Página de login explícita
-        if 'spfbl login page' in html_lower:
+
+        # MARCADORES NEGATIVOS - Indicam que NÃO está autenticado
+        # Página de login explícita (qualquer variação)
+        if 'spfbl login' in html_lower:
             return False
-        # Se ainda contém campo otp, não autenticou
-        if re.search(r'name=[\"\\\']?otp\\b', html_lower):
+        # Se contém campo otp/password, ainda está na página de login
+        if re.search(r'name=["\']?(otp|password)\b', html_lower):
             return False
-        # Marcadores positivos conhecidos
-        if 'painel de controle' in html_lower or 'control panel' in html_lower:
+        # Mensagens de erro conhecidas
+        if 'could not send' in html_lower or 'totp secret' in html_lower:
+            return False
+        # Solicitar TOTP
+        if 'does not have a' in html_lower and 'totp' in html_lower:
+            return False
+
+        # MARCADOR POSITIVO - Única forma de confirmar autenticação
+        # Só retorna True se encontrar o painel de controle explicitamente
+        if 'painel de controle do spfbl' in html_lower or 'spfbl control panel' in html_lower:
             return True
-        # Fallback: se não parece página de login, assume autenticado
-        return True
+
+        # SEGURANÇA: Se não encontrou marcador positivo, retorna False
+        # Nunca assumir autenticado por padrão!
+        return False
 
     def _verify_legacy_otp_login(self, base_url, email_path, secret):
         cookie_jar = http.cookiejar.CookieJar()

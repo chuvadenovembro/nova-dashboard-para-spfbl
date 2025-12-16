@@ -1,5 +1,16 @@
 # Changelog
 
+## [v0.06] - Correção crítica de segurança na autenticação (2025-12-15)
+
+### Melhorias
+- Detecção mais robusta de página de login do painel legado com marcadores negativos adicionais
+
+### Correções
+- Correção crítica: Fallback perigoso na autenticação que permitia acesso sem senha correta
+- Validação restritiva do HTML de resposta do painel legado (apenas marcadores positivos reconhecidos)
+
+---
+
 ## [v0.05] - Listas, segurança e alertas
 
 ### Novo
