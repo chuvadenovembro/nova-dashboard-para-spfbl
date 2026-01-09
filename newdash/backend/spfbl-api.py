@@ -86,9 +86,32 @@ LOCKOUT_TIME = 1800  # 30 minutos de bloqueio após exceder tentativas (aumentad
 MAX_CHECK_STATUS_ATTEMPTS = 3  # Máximo de verificações por minuto
 RATE_LIMIT_WINDOW = 60  # Janela de 1 minuto em segundos
 
+# Configurações de Rate Limiting para /api/user/request-totp (anti-spam / anti-enumeração)
+try:
+    MAX_TOTP_REQUESTS_PER_IP = int(os.environ.get('SPFBL_MAX_TOTP_REQ_PER_IP', '5'))
+except Exception:
+    MAX_TOTP_REQUESTS_PER_IP = 5
+
+try:
+    MAX_TOTP_REQUESTS_PER_EMAIL = int(os.environ.get('SPFBL_MAX_TOTP_REQ_PER_EMAIL', '3'))
+except Exception:
+    MAX_TOTP_REQUESTS_PER_EMAIL = 3
+
+try:
+    TOTP_RATE_LIMIT_WINDOW = int(os.environ.get('SPFBL_TOTP_RATE_LIMIT_WINDOW', '3600'))  # 1 hora
+except Exception:
+    TOTP_RATE_LIMIT_WINDOW = 3600
+
 # Configurações de Segurança de Cookies
 # Definir como True se estiver usando HTTPS em produção
 USE_SECURE_COOKIES = os.environ.get('SPFBL_USE_HTTPS', 'false').lower() == 'true'
+
+# Confiar em headers de proxy (X-Forwarded-Proto) apenas quando explicitamente habilitado
+TRUST_PROXY_HEADERS = os.environ.get('SPFBL_TRUST_PROXY_HEADERS', 'false').lower() == 'true'
+
+# Exigir TOTP para login do admin quando SMTP estiver habilitado (mitiga bypass de 2FA).
+# Emergência: password ainda funciona quando SMTP está desabilitado.
+ENFORCE_ADMIN_TOTP = os.environ.get('SPFBL_ENFORCE_ADMIN_TOTP', 'true').lower() == 'true'
 
 # Configurações de CORS - Origens permitidas
 # IMPORTANTE: Adicione aqui apenas as origens confiáveis
@@ -121,6 +144,9 @@ update_cache_lock = threading.Lock()
 sessions = {}  # {token: {'email': 'user@domain', 'created': timestamp}}
 login_attempts = {}  # {ip: {'count': 0, 'locked_until': timestamp}}
 check_status_attempts = {}  # {ip: {'count': 0, 'reset_at': timestamp}} - Rate limiting para /api/user/check-status
+totp_request_attempts_ip = {}  # {ip: {'count': 0, 'reset_at': timestamp}}
+totp_request_attempts_email = {}  # {email: {'count': 0, 'reset_at': timestamp}}
+totp_request_attempts_lock = threading.Lock()
 
 class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     # Timeout de segurança para prevenir conexões travadas
@@ -273,6 +299,89 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         # Não permitir outras origens
         return None
 
+    def is_request_secure(self):
+        """Retorna True se a requisição é (ou foi) HTTPS."""
+        try:
+            # Se o servidor estiver rodando diretamente com TLS, a conexão será um SSLSocket.
+            if hasattr(self.connection, 'cipher'):
+                return True
+        except Exception:
+            pass
+        if USE_SECURE_COOKIES:
+            return True
+        if not TRUST_PROXY_HEADERS:
+            return False
+        forwarded_proto = (self.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip().lower()
+        if forwarded_proto == 'https':
+            return True
+        forwarded_ssl = (self.headers.get('X-Forwarded-Ssl') or '').strip().lower()
+        if forwarded_ssl in {'on', '1', 'true', 'yes'}:
+            return True
+        return False
+
+    def get_client_ip(self):
+        """Obtém IP do cliente, suportando proxy quando habilitado."""
+        if TRUST_PROXY_HEADERS:
+            forwarded_for = (self.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+            if forwarded_for:
+                try:
+                    ipaddress.ip_address(forwarded_for)
+                    return forwarded_for
+                except ValueError:
+                    pass
+
+            real_ip = (self.headers.get('X-Real-IP') or '').strip()
+            if real_ip:
+                try:
+                    ipaddress.ip_address(real_ip)
+                    return real_ip
+                except ValueError:
+                    pass
+
+        return self.client_address[0]
+
+    def is_allowed_request_origin(self):
+        """Valida Origin/Referer para mitigar CSRF e login CSRF."""
+        origin = (self.headers.get('Origin') or '').strip()
+        if not origin:
+            referer = (self.headers.get('Referer') or '').strip()
+            if referer:
+                try:
+                    parsed = urllib.parse.urlparse(referer)
+                    if parsed.scheme and parsed.netloc:
+                        origin = f"{parsed.scheme}://{parsed.netloc}"
+                except Exception:
+                    origin = ''
+
+        # Sem Origin/Referer: bloquear por padrão (CSRF hardening).
+        if not origin:
+            return False
+
+        origin_candidate = origin.rstrip('/')
+
+        # Permitidas explícitas via env var / localhost em dev
+        if self.get_allowed_origin(origin_candidate):
+            return True
+
+        # Permitir mesma origem do Host atual (sem exigir configuração adicional)
+        host = (self.headers.get('Host') or '').strip()
+        if not host:
+            return False
+        return origin_candidate in {f'http://{host}', f'https://{host}'}
+
+    def enforce_origin_for_unsafe_methods(self):
+        """Bloqueia requisições cross-site (com Origin/Referer inválidos) para métodos com efeito."""
+        if self.command in {'POST', 'PUT', 'PATCH', 'DELETE'}:
+            path = urlparse(self.path).path
+            # Endpoint token-auth (server-to-server) não depende de Origin/Referer
+            if path == '/api/fraud-events':
+                return True
+
+            if not self.is_allowed_request_origin():
+                self.send_json_response({'error': 'Forbidden'}, 403)
+                return False
+        return True
+
     def do_OPTIONS(self):
         """Handle CORS preflight requests"""
         origin = self.headers.get('Origin')
@@ -424,6 +533,9 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         parsed_path = urlparse(self.path)
         path = parsed_path.path
 
+        if not self.enforce_origin_for_unsafe_methods():
+            return
+
         if path == '/api/login':
             self.handle_login()
         elif path == '/api/user/request-totp':
@@ -547,7 +659,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def check_user_totp_status(self, email):
         """Check if user has TOTP enabled (public endpoint)"""
         # Rate limiting: 3 tentativas por minuto por IP
-        client_ip = self.client_address[0]
+        client_ip = self.get_client_ip()
 
         if self.is_check_status_rate_limited(client_ip):
             self.send_json_response({
@@ -565,33 +677,44 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            # PRIMEIRO: Verificar se é admin - pegar email do admin do spfbl.conf
-            admin_email = self.get_admin_email()
-            if admin_email and email.lower() == admin_email.lower():
-                # Admin sempre é considerado com TOTP (desabilita tela de primeiro acesso)
-                self.send_json_response({
-                    'success': True,
-                    'has_totp': True,
-                    'message': 'Admin user - TOTP check bypassed'
-                })
-                return
-
             # O painel legado sempre retorna a página de login sem credenciais,
             # então não é possível detectar TOTP de forma confiável via HTTP.
             # Para evitar falsos negativos, retornamos has_totp=True aqui.
+            #
+            # SEGURANÇA: não diferenciar respostas para evitar enumeração de usuários/admin.
             self.send_json_response({
                 'success': True,
                 'has_totp': True,
-                'message': 'TOTP status not detectable via API'
             })
             return
 
-        except Exception as e:
-            self.send_json_response({'error': f'Error checking status: {str(e)}'}, 500)
+        except Exception:
+            # SEGURANÇA: não expor detalhes internos em endpoint público.
+            self.send_json_response({'success': True, 'has_totp': True})
+
+    def _rate_limit_bucket(self, bucket, key, max_attempts, window_seconds):
+        now = time.time()
+        with totp_request_attempts_lock:
+            state = bucket.get(key)
+            if not state or now > state.get('reset_at', 0):
+                bucket[key] = {'count': 1, 'reset_at': now + window_seconds}
+                return False, window_seconds
+
+            if state.get('count', 0) >= max_attempts:
+                retry_after = int(state.get('reset_at', now) - now)
+                return True, max(1, retry_after)
+
+            state['count'] = state.get('count', 0) + 1
+            bucket[key] = state
+            retry_after = int(state.get('reset_at', now) - now)
+            return False, max(1, retry_after)
 
     def handle_request_totp(self):
         """Handle TOTP request for new users (with reCAPTCHA validation)"""
         try:
+            # Rate limiting anti-abuso (por IP + por email)
+            client_ip = self.get_client_ip()
+
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length)
 
@@ -607,6 +730,28 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             # Validar formato de email
             if not self.is_valid_email(email):
                 self.send_json_response({'error': 'Invalid email format'}, 400)
+                return
+
+            # Aplicar rate limit somente após validação do formato (reduz custo de armazenamento)
+            limited_ip, retry_ip = self._rate_limit_bucket(
+                totp_request_attempts_ip,
+                client_ip,
+                max_attempts=max(1, MAX_TOTP_REQUESTS_PER_IP),
+                window_seconds=max(60, TOTP_RATE_LIMIT_WINDOW),
+            )
+            limited_email, retry_email = self._rate_limit_bucket(
+                totp_request_attempts_email,
+                email.lower(),
+                max_attempts=max(1, MAX_TOTP_REQUESTS_PER_EMAIL),
+                window_seconds=max(60, TOTP_RATE_LIMIT_WINDOW),
+            )
+            if limited_ip or limited_email:
+                retry_after = max(retry_ip, retry_email)
+                self.send_json_response({
+                    'error': 'Too many requests',
+                    'message': 'Aguarde alguns minutos e tente novamente.',
+                    'retry_after': retry_after
+                }, 429)
                 return
 
             # Verificar reCAPTCHA se configurado em spfbl.conf
@@ -625,46 +770,32 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                     }, 400)
                     return
 
-            # Verificar se usuário existe
-            result = subprocess.run(
-                ['/sbin/spfbl', 'user', 'show'],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
+            # SEGURANÇA: Não revelar se o usuário existe (mitiga enumeração).
+            # Tentamos enviar o TOTP, mas retornamos sempre uma mensagem genérica em caso de sucesso lógico.
+            try:
+                subprocess.run(
+                    ['/sbin/spfbl', 'user', 'send-totp', email],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+            except Exception:
+                # Não expor detalhes (SMTP/usuário inexistente/etc). Apenas continue.
+                pass
 
-            if email not in result.stdout:
-                self.send_json_response({
-                    'error': 'User not found',
-                }, 404)
-                return
-
-            # Executar comando para enviar TOTP
-            result = subprocess.run(
-                ['/sbin/spfbl', 'user', 'send-totp', email],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            output = (result.stdout + result.stderr).strip()
-
-            if 'TOTP' in output.upper() or result.returncode == 0:
-                self.send_json_response({
-                    'success': True,
-                    'message': 'TOTP code sent to your email. Please check your inbox.',
-                    'email': email
-                })
-            else:
-                self.send_json_response({
-                    'error': 'Failed to send TOTP code',
-                    'details': output
-                }, 500)
+            self.send_json_response({
+                'success': True,
+                'message': 'Se o usuário existir, um código foi enviado para o email informado.'
+            })
 
         except subprocess.TimeoutExpired:
-            self.send_json_response({'error': 'Timeout sending TOTP'}, 500)
+            # Não expor diferença entre falhas para evitar enumeração; trate como genérico.
+            self.send_json_response({
+                'success': True,
+                'message': 'Se o usuário existir, um código foi enviado para o email informado.'
+            })
         except Exception as e:
-            self.send_json_response({'error': f'Error: {str(e)}'}, 500)
+            self.send_json_response({'error': 'Internal error'}, 500)
 
     def get_admin_email(self):
         """Get admin email from multiple sources with fallback"""
@@ -1003,7 +1134,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
     def handle_login(self):
         """Handle login authentication"""
         try:
-            client_ip = self.client_address[0]
+            client_ip = self.get_client_ip()
 
             # Verificar se IP está bloqueado por tentativas excessivas
             if self.is_ip_locked(client_ip):
@@ -1036,6 +1167,17 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 self.increment_login_attempts(client_ip)
                 self.send_json_response({'error': 'Password or TOTP code is required'}, 400)
                 return
+
+            # Correção (AUTHZ-VULN-07): exigir TOTP para admin quando SMTP está habilitado.
+            if ENFORCE_ADMIN_TOTP and self.is_admin_email(email):
+                is_otp_code = password.isdigit() and len(password) == 6
+                kv = self._parse_spfbl_conf_kv()
+                if self._compute_smtp_enabled(kv) and not is_otp_code:
+                    self.send_json_response({
+                        'error': 'Conta admin requer código TOTP (6 dígitos). Use o botão "Primeiro acesso ou reenviar TOTP".',
+                        'totp_required': True
+                    }, 401)
+                    return
 
             authenticated = False
             auth_method = 'password'
@@ -1073,6 +1215,13 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('X-Frame-Options', 'DENY')
+                if self.is_request_secure():
+                    self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+                self.send_header('Referrer-Policy', 'same-origin')
+                self.send_header('Permissions-Policy', 'geolocation=(), microphone=(), camera=()')
 
                 # Configurar CORS apenas para origens permitidas
                 if allowed_origin:
@@ -1083,7 +1232,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                 cookie = SimpleCookie()
                 cookie['session_token'] = token
                 cookie['session_token']['httponly'] = True
-                cookie['session_token']['secure'] = USE_SECURE_COOKIES  # True se HTTPS habilitado
+                cookie['session_token']['secure'] = self.is_request_secure()  # True se HTTPS (ou proxy confiável) habilitado
                 cookie['session_token']['samesite'] = 'Strict'
                 cookie['session_token']['max-age'] = SESSION_TIMEOUT
                 cookie['session_token']['path'] = '/'
@@ -1109,8 +1258,8 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
                     'remaining_attempts': max(0, remaining)
                 }, 401)
 
-        except Exception as e:
-            self.send_json_response({'error': f'Login error: {str(e)}'}, 500)
+        except Exception:
+            self.send_json_response({'error': 'Internal error'}, 500)
 
     def handle_logout(self):
         """Handle logout"""
@@ -1123,7 +1272,22 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Set-Cookie', 'session_token=; Max-Age=0; Path=/')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        if self.is_request_secure():
+            self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+        self.send_header('Referrer-Policy', 'same-origin')
+        self.send_header('Permissions-Policy', 'geolocation=(), microphone=(), camera=()')
+
+        delete_cookie = SimpleCookie()
+        delete_cookie['session_token'] = ''
+        delete_cookie['session_token']['path'] = '/'
+        delete_cookie['session_token']['max-age'] = 0
+        delete_cookie['session_token']['httponly'] = True
+        delete_cookie['session_token']['secure'] = self.is_request_secure()
+        delete_cookie['session_token']['samesite'] = 'Strict'
+        self.send_header('Set-Cookie', delete_cookie['session_token'].OutputString())
         self.end_headers()
         self.wfile.write(json.dumps({'success': True}).encode())
 
@@ -1344,23 +1508,38 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         2. GET a mesma URL com o cookie retornado.
         3. Considera autenticado se a resposta não for a página de login.
         """
-        base_url = os.environ.get('SPFBL_PANEL_URL', 'http://127.0.0.1:8001')
-
-        # VALIDAÇÃO: Garantir que o painel legado está em localhost
-        if base_url and '127.0.0.1' not in base_url and 'localhost' not in base_url:
-            # Não permitir acesso a painéis externos
+        base_url = self.get_legacy_panel_base_url()
+        if not base_url:
             return False
-
-        try:
-            parsed = urllib.parse.urlparse(base_url)
-            if not parsed.scheme:
-                base_url = 'http://' + base_url
-        except Exception:
-            base_url = 'http://127.0.0.1:8001'
 
         email_path = '/' + urllib.parse.quote(email)
 
         return self._verify_legacy_otp_login(base_url, email_path, otp_code)
+
+    def get_legacy_panel_base_url(self):
+        """Retorna base_url do painel legado apenas se for loopback (mitiga SSRF)."""
+        base_url = (os.environ.get('SPFBL_PANEL_URL') or 'http://127.0.0.1:8001').strip()
+        if not base_url:
+            base_url = 'http://127.0.0.1:8001'
+
+        try:
+            parsed = urllib.parse.urlparse(base_url)
+            if not parsed.scheme:
+                parsed = urllib.parse.urlparse('http://' + base_url)
+
+            host = (parsed.hostname or '').strip().lower()
+            if host not in {'127.0.0.1', 'localhost'}:
+                return None
+
+            scheme = parsed.scheme.lower() if parsed.scheme else 'http'
+            if scheme not in {'http', 'https'}:
+                scheme = 'http'
+
+            # Remove path/query para evitar concatenação inesperada
+            netloc = parsed.netloc
+            return f'{scheme}://{netloc}'
+        except Exception:
+            return 'http://127.0.0.1:8001'
 
     def verify_password_with_spfbl(self, email, password):
         """Verify password/OTP using the legacy SPFBL HTTP login.
@@ -1376,19 +1555,9 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
         2. GET a mesma URL com o cookie retornado.
         3. Considera autenticado se a resposta não for a página de login.
         """
-        base_url = os.environ.get('SPFBL_PANEL_URL', 'http://127.0.0.1:8001')
-
-        # VALIDAÇÃO: Garantir que o painel legado está em localhost
-        if base_url and '127.0.0.1' not in base_url and 'localhost' not in base_url:
-            # Não permitir acesso a painéis externos
+        base_url = self.get_legacy_panel_base_url()
+        if not base_url:
             return False
-
-        try:
-            parsed = urllib.parse.urlparse(base_url)
-            if not parsed.scheme:
-                base_url = 'http://' + base_url
-        except Exception:
-            base_url = 'http://127.0.0.1:8001'
 
         email_path = '/' + urllib.parse.quote(email)
 
@@ -1679,7 +1848,10 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('X-Frame-Options', 'DENY')
             self.send_header('X-XSS-Protection', '1; mode=block')
-            self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+            if self.is_request_secure():
+                self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+            self.send_header('Referrer-Policy', 'same-origin')
+            self.send_header('Permissions-Policy', 'geolocation=(), microphone=(), camera=()')
 
             # Permitir domínios necessários para o reCAPTCHA sem abrir o restante da política
             self.send_header('Content-Security-Policy', self.build_csp_policy())
@@ -1698,6 +1870,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
 
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
+        self.send_header('Cache-Control', 'no-store')
 
         # Configurar CORS apenas para origens permitidas
         if allowed_origin:
@@ -1705,6 +1878,11 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Credentials', 'true')
 
         self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        if self.is_request_secure():
+            self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+        self.send_header('Referrer-Policy', 'same-origin')
+        self.send_header('Permissions-Policy', 'geolocation=(), microphone=(), camera=()')
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
@@ -1855,7 +2033,7 @@ class SPFBLSecureAPIHandler(BaseHTTPRequestHandler):
             'recipient': body.get('recipient', ''),
             'result': reason,
             'reason': reason,
-            'reporter': self.client_address[0]
+            'reporter': self.get_client_ip()
         }
 
         self.append_fraud_event(event)
@@ -4289,8 +4467,11 @@ document.addEventListener('DOMContentLoaded', function() {
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('X-Frame-Options', 'DENY')
         self.send_header('X-XSS-Protection', '1; mode=block')
-        self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+        if self.is_request_secure():
+            self.send_header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
         self.send_header('Content-Security-Policy', self.build_csp_policy())
+        self.send_header('Referrer-Policy', 'same-origin')
+        self.send_header('Permissions-Policy', 'geolocation=(), microphone=(), camera=()')
         self.end_headers()
         self.wfile.write(page.encode('utf-8', errors='replace'))
 
@@ -4579,7 +4760,7 @@ document.addEventListener('DOMContentLoaded', function() {
     def log_message(self, format, *args):
         """Custom logging with security info"""
         # Log de acesso com informações de segurança
-        client_ip = self.client_address[0]
+        client_ip = self.get_client_ip()
         message = f"{client_ip} - {format%args}"
 
         # Log de acesso habilitado para auditoria
@@ -4630,10 +4811,29 @@ if __name__ == '__main__':
         request_queue_size = 50
 
     server = ThreadedHTTPServer(('0.0.0.0', PORT), SPFBLSecureAPIHandler)
-    print(f"🔒 SPFBL Secure Dashboard running on http://0.0.0.0:{PORT}")
-    print(f"   Dashboard: http://0.0.0.0:{PORT}/dashboard.html")
-    print(f"   Login: http://0.0.0.0:{PORT}/login")
-    print(f"   API: http://0.0.0.0:{PORT}/api/stats")
+
+    # TLS opcional (mitiga captura de credenciais em HTTP)
+    tls_cert = (os.environ.get('SPFBL_TLS_CERT') or '').strip()
+    tls_key = (os.environ.get('SPFBL_TLS_KEY') or '').strip()
+    tls_enabled = bool(tls_cert and tls_key and os.path.exists(tls_cert) and os.path.exists(tls_key))
+    if tls_cert and tls_key and not tls_enabled:
+        print("   [WARN] SPFBL_TLS_CERT/SPFBL_TLS_KEY definidos, mas arquivos não existem; iniciando SEM TLS.", file=sys.stderr)
+
+    if tls_enabled:
+        try:
+            import ssl
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile=tls_cert, keyfile=tls_key)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+        except Exception as e:
+            tls_enabled = False
+            print(f"   [WARN] Falha ao habilitar TLS; iniciando SEM TLS. Motivo: {e}", file=sys.stderr)
+
+    scheme = 'https' if tls_enabled else 'http'
+    print(f"🔒 SPFBL Secure Dashboard running on {scheme}://0.0.0.0:{PORT}")
+    print(f"   Dashboard: {scheme}://0.0.0.0:{PORT}/dashboard.html")
+    print(f"   Login: {scheme}://0.0.0.0:{PORT}/login")
+    print(f"   API: {scheme}://0.0.0.0:{PORT}/api/stats")
     print(f"")
     print(f"   Session timeout: {SESSION_TIMEOUT}s")
     print(f"   Max login attempts: {MAX_LOGIN_ATTEMPTS}")

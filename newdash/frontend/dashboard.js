@@ -796,7 +796,7 @@ function updateSpamBlocksCard(spamData) {
     const hostBlocked = spamData.host_blocked || 0;
     const domainBlocked = spamData.domain_blocked || 0;
     const ipBlocked = spamData.ip_blocked || 0;
-    const totalBlocked = ipBlocked; // total de eventos na janela
+    const totalBlocked = hostBlocked + domainBlocked + ipBlocked;
 
     document.getElementById('spam-total-direct').textContent = totalBlocked.toLocaleString('pt-BR');
     document.getElementById('spam-host-direct').textContent = hostBlocked.toLocaleString('pt-BR');

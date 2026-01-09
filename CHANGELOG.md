@@ -1,5 +1,19 @@
 # Changelog
 
+## [v0.07] - Hardening de segurança (2025-12-22)
+
+### Melhorias
+- Validação de `Origin/Referer` em métodos com efeito (mitiga CSRF/login CSRF)
+- Rate limiting no envio de TOTP (por IP e por email, via env)
+- TLS opcional no serviço (cert/key via env) e suporte a proxy para cookies `Secure`/HSTS
+
+### Correções
+- Respostas uniformes em endpoints públicos de TOTP (mitiga enumeração de usuários/admin)
+- Admin passa a exigir TOTP quando SMTP está habilitado (remove bypass de 2FA)
+- Logout e respostas JSON com headers mais restritivos
+
+---
+
 ## [v0.06] - Correção de segurança, melhorias e otimizações (2025-12-15)
 
 ### Melhorias

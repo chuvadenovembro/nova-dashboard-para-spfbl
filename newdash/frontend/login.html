@@ -263,6 +263,10 @@
                     // Login falhou
                     let errorMsg = data.error || 'Credenciais inválidas';
 
+                    if (data.totp_required) {
+                        showFirstAccessForm(email);
+                    }
+
                     if (data.remaining_attempts !== undefined) {
                         errorMsg += ` (${data.remaining_attempts} tentativas restantes)`;
                     }
