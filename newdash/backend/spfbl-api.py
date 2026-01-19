@@ -111,7 +111,8 @@ TRUST_PROXY_HEADERS = os.environ.get('SPFBL_TRUST_PROXY_HEADERS', 'false').lower
 
 # Exigir TOTP para login do admin quando SMTP estiver habilitado (mitiga bypass de 2FA).
 # Emergência: password ainda funciona quando SMTP está desabilitado.
-ENFORCE_ADMIN_TOTP = os.environ.get('SPFBL_ENFORCE_ADMIN_TOTP', 'true').lower() == 'true'
+# NOTA: Desabilitado por padrão - admin usa apenas senha. Ative via SPFBL_ENFORCE_ADMIN_TOTP=true se desejar.
+ENFORCE_ADMIN_TOTP = os.environ.get('SPFBL_ENFORCE_ADMIN_TOTP', 'false').lower() == 'true'
 
 # Configurações de CORS - Origens permitidas
 # IMPORTANTE: Adicione aqui apenas as origens confiáveis

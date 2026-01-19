@@ -1,5 +1,12 @@
 # Changelog
 
+## [v0.08] - Correção de login (2026-01-19)
+
+### Correções
+- Admin passa a nõ exigir TOTP quando SMTP está habilitado (remove bypass de 2FA)
+
+---
+
 ## [v0.07] - Hardening de segurança (2025-12-22)
 
 ### Melhorias
